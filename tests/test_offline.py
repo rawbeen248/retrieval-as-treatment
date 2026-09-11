@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rat import analysis, score  # noqa: E402
 from rat.config import load_config  # noqa: E402
 from rat.data import _parse_answers, sample_stratified  # noqa: E402
-from rat.features import build_feature_table  # noqa: E402
+from rat.features import ambiguity_feats, build_feature_table, subject_of  # noqa: E402
+from rat.dissociation import auc, boot_auc_diff, dissociation_table, headline_contrast  # noqa: E402
 from rat.generate import build_messages, clean_answer, idk_flag, truncate_words  # noqa: E402
 from rat.logs import JsonlStore  # noqa: E402
 from rat.retrieve import CachedJsonlRetriever, _parse_raw  # noqa: E402
@@ -85,12 +86,14 @@ def test_retrieve_helpers():
 
 
 def _synthetic_feat(n=600, seed=0):
-    """Popular + confident queries get hurt by retrieval; rare + unsure get helped."""
+    """Ground truth built to match the pilot: confidence drives the LEVEL (arm 0),
+    retrieval quality drives the ARM-1 outcome (and hence the effect)."""
     rng = np.random.default_rng(seed)
     log_pop = rng.uniform(0, 6, n)
     conf = np.clip(0.3 + 0.1 * log_pop + rng.normal(0, 0.15, n), 0.01, 0.999)
     y0 = (rng.uniform(size=n) < conf).astype(float)
-    p1 = np.clip(0.75 - 0.05 * log_pop + rng.normal(0, 0.1, n), 0.05, 0.95)
+    rq = rng.uniform(0, 1, n)                      # latent retrieval quality
+    p1 = np.clip(0.1 + 0.8 * rq + rng.normal(0, 0.08, n), 0.02, 0.98)
     y1 = (rng.uniform(size=n) < p1).astype(float)
     data = pd.DataFrame({"qid": [f"q{i}" for i in range(n)], "dataset": "syn", "question": [f"q {i}" for i in range(n)],
                          "answers": [["a"]] * n, "s_pop": 10 ** log_pop, "o_pop": np.nan, "log_pop": log_pop,
@@ -100,21 +103,64 @@ def _synthetic_feat(n=600, seed=0):
                        "first_tok_entropy": -np.log(conf), "ans_logprob_mean": np.log(conf), "ans_logprob_sum": np.log(conf),
                        "idk_flag": 0, "ans_ntokens": 3})
     g1 = pd.DataFrame({"qid": data["qid"], "answer": "b", "f1": y1, "em": y1, "acc": y1, "n_passages_used": 5})
-    retr = {q: [{"score": float(s)} for s in sorted(rng.uniform(5, 30, 10), reverse=True)] for q in data["qid"]}
+    data["subj"] = ["E" * int(2 + 18 * rq[i]) for i in range(n)]   # ambiguity tracks retrieval quality
+    retr = {}
+    for i, q in enumerate(data["qid"]):
+        top = 6 + 30 * rq[i] + rng.normal(0, 1.0)
+        scores = sorted([top] + list(top - rng.uniform(0.5, 6, 9)), reverse=True)
+        retr[q] = [{"score": float(sc), "title": data["subj"].iloc[i] if j == 0 else f"Other {j}", "text": "t"}
+                   for j, sc in enumerate(scores)]
     return data, g0, g1, retr
+
+
+def test_ambiguity_helpers():
+    a = ambiguity_feats("Idaho")
+    assert a["subj_chars"] == 5 and a["subj_ntokens"] == 1 and a["subj_single_token"] == 1 and a["subj_is_short"] == 1
+    b = ambiguity_feats("Welcome to the Dollhouse")
+    assert b["subj_ntokens"] == 4 and b["subj_is_short"] == 0
+    assert subject_of({"subj": "Turin", "question": "x"}) == "Turin"
+    # fallback entity extraction for datasets without `subj`
+    got = subject_of({"subj": "", "question": "Who directed Welcome to the Dollhouse?"})
+    assert "Dollhouse" in got
+
+
+def test_dissociation_recovers_ground_truth():
+    """Confidence must look strong on the level and flat on the effect; the
+    retrieval feature the reverse. This is the paper's claim, on synthetic data."""
+    data, g0, g1, retr = _synthetic_feat(n=800, seed=3)
+    feat = build_feature_table(data, g0, g1, retr, top_k=5)
+    d = dissociation_table(feat, n_boot=200).set_index("feature")
+    # confidence owns the level; retrieval owns the effect on the decision-live subset
+    assert d.loc["probe_maxprob_mean", "auc_level"] > 0.65
+    assert abs(d.loc["retr_top1", "auc_level"] - 0.5) < 0.12
+    assert d.loc["retr_top1", "auc_effect_live"] > 0.70
+    assert (abs(d.loc["retr_top1", "auc_effect_live"] - 0.5)
+            > abs(d.loc["probe_maxprob_mean", "auc_effect_live"] - 0.5))
+    assert d["n_live"].iloc[0] == int(((feat["delta_acc"] != 0)).sum())
+    h = headline_contrast(feat, n_boot=200)
+    assert h["diff_on_effect"]["p_gt_0"] > 0.95
+    assert "live only" in h["diff_on_effect"]["target"]
+    # AUC sanity: perfect and inverted predictors
+    y = np.array([0, 0, 1, 1]); assert auc(np.array([1, 2, 3, 4]), y) == 1.0
+    assert auc(np.array([4, 3, 2, 1]), y) == 0.0
+    bd = boot_auc_diff(feat, "retr_top1", "probe_maxprob_mean", "helped", n_boot=100)
+    assert bd["diff"] > 0 and bd["lo"] < bd["hi"]
 
 
 def test_features_and_gate_identity():
     data, g0, g1, retr = _synthetic_feat()
     feat = build_feature_table(data, g0, g1, retr, top_k=5)
     assert len(feat) == len(data)
-    for c in ["y0_f1", "y1_f1", "delta_f1", "probe_maxprob_mean", "retr_top1", "retr_gap12"]:
+    for c in ["y0_f1", "y1_f1", "delta_f1", "probe_maxprob_mean", "retr_top1", "retr_gap12",
+              "subj_chars", "retr_top1_z_bylen", "retr_top1_resid", "retr_ratio_gap12",
+              "helped", "harmed", "both_wrong", "both_right"]:
         assert c in feat.columns
-    c = analysis.gate_curve(feat, "probe_entropy_mean", "y0_f1", "y1_f1", True, cost=0.0)
+    assert ((feat["helped"] == 1) == (feat["delta_acc"] > 0)).all()
+    c = analysis.gate_curve(feat, "probe_entropy_mean", "y0_acc", "y1_acc", True, cost=0.0)
     np.testing.assert_allclose(c["regret"], c["harm_incurred"] + c["benefit_forgone"], atol=1e-12)
     assert c["retrieval_rate"].iloc[0] == 0.0 and c["retrieval_rate"].iloc[-1] == 1.0
     assert (c["value"] <= c["oracle_value"] + 1e-12).all()
-    c2 = analysis.gate_curve(feat, "probe_entropy_mean", "y0_f1", "y1_f1", True, cost=0.1)
+    c2 = analysis.gate_curve(feat, "probe_entropy_mean", "y0_acc", "y1_acc", True, cost=0.1)
     np.testing.assert_allclose(c2["regret"], c2["harm_incurred"] + c2["benefit_forgone"], atol=1e-12)
 
 
@@ -125,15 +171,39 @@ def test_run_analysis_end_to_end():
         out = analysis.run_analysis(feat, {"dataset": "syn", "n_queries": 600, "seed": 0, "model_name": "m",
                                            "load_in_4bit": True, "retriever": "bm25", "index_name": "idx", "top_k": 5,
                                            "max_new_tokens": 32, "prefix_k": 3},
-                                    {"torch": "x"}, {"stratified": True}, os.path.join(d, "res"), os.path.join(d, "fig"))
+                                    {"torch": "x"}, {"stratified": True}, os.path.join(d, "res"), os.path.join(d, "fig"),
+                                    n_boot=100)
         assert os.path.exists(os.path.join(d, "res", "report.md"))
-        assert os.path.exists(os.path.join(d, "fig", "harm_map_f1.png"))
-        assert "Decision gate" in out["report"] and "Harm map" in out["report"]
-        # synthetic construction: harm concentrated at high pop / high conf
-        harm = out["summary"]["harm_tables"]["f1"]["harmful"]
-        hi = harm[max(harm.keys(), key=int)][max(harm[max(harm.keys(), key=int)].keys(), key=int)]
-        lo = harm[min(harm.keys(), key=int)][min(harm[min(harm.keys(), key=int)].keys(), key=int)]
-        assert hi > lo
+        assert os.path.exists(os.path.join(d, "res", "dissociation.csv"))
+        for f in ("dissociation.png", "effect_map_informative.png", "effect_map_contrast.png", "gate_regret.png"):
+            assert os.path.exists(os.path.join(d, "fig", f)), f
+        r = out["report"]
+        for section in ("Headline", "Decision gate", "Effect maps", "Harm audit", "Flip table"):
+            assert section in r, section
+        assert out["summary"]["stats"]["flips"]["helped"] > 0
+
+
+def test_harm_audit_classifies_artifacts():
+    """Pilot lesson: negative delta_f1 is often a scoring artifact, not a real flip."""
+    feat = pd.DataFrame({
+        "question": ["a", "b", "c"], "answers": [["fantasy"], ["hard rock"], ["Western"]],
+        "answer0": ["Fantasy", "Christian rock", "Western"], "answer1": ["fantasy MMORPG", "Not specified", "Idaho potato"],
+        "y0_f1": [1.0, 0.5, 1.0], "y1_f1": [0.67, 0.0, 0.0],
+        "y0_acc": [1.0, 0.0, 1.0], "y1_acc": [1.0, 0.0, 0.0],
+        "delta_f1": [-0.33, -0.5, -1.0], "subj_chars": [13, 15, 5],
+    })
+    kinds = analysis.harm_audit(feat)["kind"].tolist()
+    assert sum("genuine" in k for k in kinds) == 1
+    assert sum("artifact" in k for k in kinds) == 2
+
+
+def test_min_cell_suppression():
+    """A 1-of-3 cell must not drive a figure or a verdict."""
+    data, g0, g1, retr = _synthetic_feat(n=120, seed=7)
+    feat = build_feature_table(data, g0, g1, retr, top_k=5)
+    feat, _ = analysis.add_bins(feat, "probe_maxprob_mean", 5, 5)
+    t = analysis.cell_tables(feat, "pop_bin", "conf_bin")
+    assert (t["n"].to_numpy(dtype=float) < analysis.MIN_CELL_N).any()  # sparse by construction
 
 
 def test_config():

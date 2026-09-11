@@ -139,16 +139,98 @@ def step_features(cfg: Config, df: pd.DataFrame, gen0: pd.DataFrame, gen1: pd.Da
     return feat
 
 
-def step_analysis(cfg: Config, feat: pd.DataFrame, data_meta: dict, versions: dict) -> dict:
+def result_dirs(cfg: Config) -> Tuple[str, str]:
+    """Per-dataset subdirectories so running several datasets does not overwrite."""
     P = paths(cfg)
-    out = analysis.run_analysis(feat, cfg.to_dict(), versions, data_meta, P["results"], P["figures"],
-                                thresholds=cfg.delta_thresholds, harm_thr=cfg.harm_thr,
-                                conf_bins=cfg.conf_bins, pop_bins=cfg.pop_bins)
-    with open(os.path.join(P["results"], "versions.json"), "w") as f:
+    r = os.path.join(P["results"], cfg.dataset)
+    f = os.path.join(P["figures"], cfg.dataset)
+    os.makedirs(r, exist_ok=True); os.makedirs(f, exist_ok=True)
+    return r, f
+
+
+def step_analysis(cfg: Config, feat: pd.DataFrame, data_meta: dict, versions: dict) -> dict:
+    rdir, fdir = result_dirs(cfg)
+    out = analysis.run_analysis(feat, cfg.to_dict(), versions, data_meta, rdir, fdir,
+                                thresholds=cfg.delta_thresholds, conf_bins=cfg.conf_bins,
+                                pop_bins=cfg.pop_bins, n_boot=cfg.n_boot)
+    with open(os.path.join(rdir, "versions.json"), "w") as f:
         json.dump(versions, f, indent=2)
-    print(f"[analysis] report -> {os.path.join(P['results'], 'report.md')}")
-    print(f"[analysis] figures -> {P['figures']}")
+    print(f"[analysis] report  -> {os.path.join(rdir, 'report.md')}")
+    print(f"[analysis] figures -> {fdir}")
     return out
+
+
+def run_datasets(cfg: Config, datasets: List[str], skip_generation: bool = False,
+                 n_by_dataset: Optional[Dict[str, int]] = None) -> Dict[str, dict]:
+    """Run Phase 1 across several datasets, reusing one loaded model.
+
+    The pilot showed PopQA alone is not enough: its long tail is where retrieval
+    almost always helps, so harm has no room to appear. TriviaQA / NQ-open give
+    the model queries it already knows.
+    """
+    import dataclasses
+
+    out: Dict[str, dict] = {}
+    gen = None if skip_generation else make_generator(cfg)
+    for name in datasets:
+        n = (n_by_dataset or {}).get(name, cfg.n_queries)
+        c = dataclasses.replace(cfg, dataset=name, n_queries=n)
+        print(f"\n{'=' * 70}\n=== {name} (n = {n})\n{'=' * 70}")
+        df, meta = step_data(c)
+        retr = step_retrieve(c, df)
+        if skip_generation:
+            gen0, gen1 = gen_store(c, 0).load_df(), gen_store(c, 1).load_df()
+            versions = {}
+        else:
+            gen0 = step_generate(c, df, 0, gen=gen)
+            gen1 = step_generate(c, df, 1, gen=gen, retr_by_qid=retr)
+            versions = gen.versions
+        feat = step_features(c, df, gen0, gen1, retr)
+        out[name] = step_analysis(c, feat, meta, versions)
+        out[name]["cfg"] = c
+    if len(out) > 1:
+        write_combined(cfg, out)
+    return out
+
+
+def write_combined(cfg: Config, results: Dict[str, dict]) -> str:
+    """One cross-dataset comparison table -- the thing to look at before scaling up."""
+    import pandas as _pd
+
+    cdir = paths(cfg)["combined"]
+    os.makedirs(cdir, exist_ok=True)
+    rows, diss_rows = [], []
+    for name, r in results.items():
+        s = r["summary"]["stats"]
+        fl = s["flips"]
+        h = r["summary"].get("headline") or {}
+        rows.append({
+            "dataset": name, "n": s["acc"]["n"],
+            "Y0_acc": round(s["acc"]["y0_mean"], 3), "Y1_acc": round(s["acc"]["y1_mean"], 3),
+            "mean_delta": round(s["acc"]["delta_mean"], 3),
+            "helped": fl["helped"], "harmed": fl["harmed"],
+            "both_right": fl["both_right"], "both_wrong": fl["both_wrong"],
+            "decision_live": round(fl["decision_live_frac"], 3),
+            "conf_AUC_level": round((h.get("conf_level") or {}).get("auc", float("nan")), 3),
+            "conf_AUC_effect": round((h.get("conf_effect") or {}).get("auc", float("nan")), 3),
+            "retr_AUC_effect": round((h.get("retr_effect") or {}).get("auc", float("nan")), 3),
+        })
+        d = r.get("dissociation")
+        if d is not None and len(d):
+            dd = d.copy(); dd.insert(0, "dataset", name); diss_rows.append(dd)
+    tbl = _pd.DataFrame(rows)
+    tbl.to_csv(os.path.join(cdir, "cross_dataset.csv"), index=False)
+    if diss_rows:
+        _pd.concat(diss_rows).to_csv(os.path.join(cdir, "dissociation_all.csv"), index=False)
+    text = ("# Phase 1 — cross-dataset summary\n\n"
+            + analysis.md_table(tbl, index=False)
+            + "\n\nRead this first: `harmed` needs to be large enough to model, and the gap between "
+              "`conf_AUC_level` and `conf_AUC_effect` is the paper's headline claim.\n")
+    with open(os.path.join(cdir, "summary.md"), "w") as f:
+        f.write(text)
+    print(f"[combined] -> {os.path.join(cdir, 'summary.md')}")
+    print(text)
+    return text
 
 
 def run_all(cfg: Config, skip_generation: bool = False) -> dict:
@@ -157,7 +239,7 @@ def run_all(cfg: Config, skip_generation: bool = False) -> dict:
     versions: dict = {}
     if skip_generation:
         gen0, gen1 = gen_store(cfg, 0).load_df(), gen_store(cfg, 1).load_df()
-        vp = os.path.join(paths(cfg)["results"], "versions.json")
+        vp = os.path.join(result_dirs(cfg)[0], "versions.json")
         versions = json.load(open(vp)) if os.path.exists(vp) else {}
     else:
         gen = make_generator(cfg)

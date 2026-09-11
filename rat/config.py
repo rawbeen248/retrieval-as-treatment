@@ -52,8 +52,9 @@ class Config:
     cached_retrieval_file: Optional[str] = None  # for retriever == "cached_jsonl"
 
     delta_thresholds: Tuple[float, ...] = (0.25, 0.5, 0.75)
-    harm_thr: float = 0.5
+    harm_thr: float = 0.5          # kept for the F1-based sensitivity table only
     conf_bins: int = 5
+    n_boot: int = 2000             # bootstrap resamples for the dissociation CIs
 
     @property
     def model_tag(self) -> str:
@@ -78,6 +79,7 @@ def paths(cfg: Config) -> dict:
         "features": os.path.join(w, "features"),
         "results": os.path.join(w, "results", "phase1"),
         "figures": os.path.join(w, "figures", "phase1"),
+        "combined": os.path.join(w, "results", "phase1_combined"),
         "pyserini_cache": os.path.join(w, "pyserini_cache"),
     }
 

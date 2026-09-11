@@ -6,7 +6,37 @@
 
 **Target venues.** ARR December 2026 cycle → ACL 2027 (main or Findings); fallbacks: UncertaiNLP 2027, TrustNLP, or an IR venue (SIGIR / CIKM short). The paper is a *method + tool* paper with a small theory section, which fits ACL/EMNLP "efficient methods" and "evaluation" tracks.
 
-**Status.** Design document. No experiments run yet. Every number that appears in the eventual paper must be regenerable from the released code (this rule carried over from the previous project and stays).
+**Status.** Revised after the Phase-1 pilot (n=100, PopQA, Qwen2.5-7B-Instruct, BM25 top-5). Every number that appears in the eventual paper must be regenerable from the released code (this rule carried over from the previous project and stays).
+
+---
+
+## 0. Pilot results and what they changed
+
+The pilot was run to check whether retrieval harm is common enough to motivate the paper. It is not — and the run produced a stronger result instead.
+
+**Measured (n=100, PopQA, Qwen2.5-7B-Instruct, BM25 top-5, greedy):**
+
+| quantity | value |
+|---|---|
+| Y⁰ containment accuracy / Y¹ | 0.20 / 0.34 |
+| flips: helped / harmed / both right / both wrong | 17 / 3 / 17 / 63 |
+| decision-live fraction (arms disagree) | 20% |
+| confidence (`probe_maxprob_mean`) → level AUC | **0.844** [0.734, 0.934] |
+| confidence → effect AUC | **0.444** [0.289, 0.592] |
+| BM25 top-1 → effect AUC | **0.906** [0.842, 0.959] |
+| BM25 top-1 → level AUC | 0.703 [0.573, 0.816] |
+| subject-name length → effect AUC | 0.823 [0.686, 0.923] |
+| popularity → effect AUC | 0.477 [0.326, 0.625] |
+
+**Five findings and their consequences.**
+
+1. **The dissociation is real and is the paper's thesis.** Confidence predicts the level well and the effect at chance; retrieval-side and ambiguity signals invert this. Paired bootstrap on the decision-live subset: retrieval − confidence on the effect = +0.588 [+0.333, +0.819], P(>0)=1.000. **Consequence:** the dissociation becomes the paper's opening claim and Figure 1 (§3, §4.5a). It does not depend on harm being common, which makes the paper robust to the harm rate at scale.
+2. **The harm map, as designed, does not reproduce.** Mean Δ across popularity bins: 0.133, 0.053, 0.163, 0.092, 0.179 — no trend; confidence bins likewise flat. Two causes: the sample never reached the popular tail (max log_pop 5.25 vs 7.18 available), and a 7B model on PopQA's long tail is wrong in both arms 63% of the time. **Consequence:** the harm map is demoted from lede to support; its axes become retrieval score × ambiguity, with confidence × popularity kept as a deliberate contrast figure showing the axes gates use are flat.
+3. **Harm has a specific mechanism: entity ambiguity, not popularity.** All three genuine flips were short polysemous subjects (`Idaho` → "Idaho potato", `Summit` → Panama, `X` → "The X Factor SA"). Mean Δ by subject-name length: −0.047 (short) → +0.125 (mid) → +0.394 (long). **Consequence:** ambiguity features added to tier F0 (§4.3); the mechanism is a named finding in the paper rather than an unexplained quadrant.
+4. **Token-F1 over-counts harm roughly 2×.** Of seven negative-ΔF1 cases, three were genuine right→wrong flips; two had arm 1 still containing the gold answer but penalised for extra tokens ("fantasy MMORPG" vs gold "fantasy"; "Metropolitan City of Turin" vs "Province of Turin"), and two were both-arms-wrong partial credit. **Consequence:** containment accuracy becomes the primary effect definition; F1 remains the continuous outcome; every negative case is classified in a harm-audit table (§4.4).
+5. **Raw BM25 scores are not comparable across queries.** `retr_top1` correlates r=0.70 with subject-name length (longer names ⇒ more IDF mass); residualising on name and question length drops the effect AUC from 0.906 to 0.663. **Consequence:** normalized retrieval features added to tier F1 and used for all headline claims; raw score reported only for reference (§4.3).
+
+**A sixth point, methodological, found while implementing the analysis.** `helped` requires arm 0 to be wrong, so *any* predictor of the level mechanically anti-predicts `helped` over the full sample, whether or not it knows anything about retrieval. All headline effect AUCs are therefore computed on the **decision-live subset** (arms disagree, so exactly one of helped/harmed holds). Full-sample AUCs are still reported in the appendix. A reviewer would otherwise catch this, and it would invalidate the central table.
 
 ---
 
@@ -81,11 +111,12 @@ Potential outcomes (Rubin 1974); AIPW / doubly-robust estimation (Robins, Rotnit
 
 ## 3. Contributions (what the paper claims)
 
-1. **Formulation.** Adaptive retrieval as treatment-effect estimation and policy learning; a proposition characterizing exactly when proxy gates are optimal, and a regret decomposition (harm vs forgone benefit) that is directly measurable in our setup.
-2. **A harm map.** The first systematic measurement of where retrieval *lowers* answer quality, as a function of pre-retrieval signals (base-model confidence × entity popularity), across datasets, two retriever tiers, and two LLMs.
-3. **Effect-based gating.** DR-learner CATE estimation from pre-decision features; policies that dominate uncertainty, complexity, and popularity gates on the accuracy-vs-cost frontier at matched retrieval rate; regret bound stated and empirically checked against the observed oracle.
-4. **Zero-regeneration gate evaluation (the tool).** A DR off-policy estimator with bootstrap CIs that scores any gating rule from one logged randomized run; validated against ground-truth re-execution for a set of published and synthetic gates; released with the logged dataset so others can benchmark new gates without a GPU.
-5. **Multi-arm extension.** Action sets over retrieval depth × retriever × iterative retrieval, where full-factorial evaluation becomes expensive and OPE's cost advantage is large.
+1. **The level-vs-effect dissociation.** The paper's central empirical claim, and Figure 1: signals the literature gates on predict whether the model is wrong (AUC ≈ 0.84 in the pilot) but not whether retrieval will help (≈ 0.44, CI straddling chance), while cheap retrieval-side and entity-ambiguity signals invert this. Measured across datasets, retriever tiers, and models, with bootstrap CIs and paired contrasts on the decision-live subset.
+2. **Formulation.** Adaptive retrieval as treatment-effect estimation and policy learning; a proposition characterizing exactly when proxy gates are optimal, and a regret decomposition (harm vs forgone benefit) that is directly measurable in our setup. The dissociation is the empirical counterpart of the proposition.
+3. **Effect maps and the ambiguity mechanism.** Where retrieval lowers answer quality, mapped on axes that carry signal (retrieval score × entity ambiguity) with the literature's axes (confidence × popularity) as an explicit contrast, plus an audit separating genuine flips from scoring artifacts.
+4. **Effect-based gating.** DR-learner CATE estimation from pre-decision features; policies that dominate uncertainty, complexity, and popularity gates on the accuracy-vs-cost frontier at matched retrieval rate; regret bound stated and empirically checked against the observed oracle.
+5. **Zero-regeneration gate evaluation (the tool).** A DR off-policy estimator with bootstrap CIs that scores any gating rule from one logged randomized run; validated against ground-truth re-execution for a set of published and synthetic gates; released with the logged dataset so others can benchmark new gates without a GPU.
+6. **Multi-arm extension.** Action sets over retrieval depth × retriever × iterative retrieval, where full-factorial evaluation becomes expensive and OPE's cost advantage is large.
 
 ---
 
@@ -107,9 +138,9 @@ Design consequence: we collect a **full-factorial calibration set** (all arms on
 
 | Dataset | Why | Notes |
 |---|---|---|
-| **PopQA** | ships entity popularity ($s_{pop}$) and relation type; maximal effect heterogeneity; the harm-map dataset | Mallen et al. 2023 |
+| **TriviaQA** | **primary.** Strong parametric knowledge for 7B models, so arm 0 is often right and retrieval has something to lose — the regime where harm can exist at all. Promoted after the pilot. | rc.nocontext |
+| **PopQA** | ships entity popularity ($s_{pop}$), relation type, and a clean subject string for ambiguity features. Pilot showed its long tail is where retrieval nearly always helps (63% both-arms-wrong), so it is the *heterogeneity* dataset, not the harm dataset. | Mallen et al. 2023 |
 | **Natural Questions (open)** | standard single-hop; popular entities; expected mixed effects | KILT/DPR splits |
-| **TriviaQA** | strong parametric knowledge for 7B models → many "retrieval unnecessary" and some "retrieval harmful" cases | unfiltered/open |
 | **HotpotQA** | multi-hop; the iterative arm matters here; expected large positive $\tau$ | distractor or fullwiki |
 | *(optional)* WebQuestions, SQuAD-open | breadth | only if time permits |
 
@@ -125,8 +156,8 @@ Sizes (initial): 3,000 queries per dataset for the full-factorial calibration se
 
 **Pre-decision features $X(q)$.** Features may not depend on the passages that will be injected. (Feedback pitfall 2 — adopted, with a cost-accounting refinement.) Two tiers, both reported:
 
-- **Tier F0 — no retrieval side-effects at all.** Query embedding; query length; named-entity count and type; entity popularity (Wikipedia page views or corpus frequency, matched by string); base-LLM signals from a single parametric forward pass — max token probability and entropy of the first $k$ answer tokens (TARG-style prefix probe), answer length, "I don't know" indicator.
-- **Tier F1 — cheap index lookups allowed.** Everything in F0 plus retriever-side scores: BM25 top-1 score, dense top-1 cosine, top-$k$ score dispersion, overlap between BM25 and dense top-$k$. These require an index search but *not* reading passages into the LLM context, which is where the dominant cost (context tokens, generation latency) lies. Report cost accounting separately for search vs generation so the saving claim is precise.
+- **Tier F0 — no retrieval side-effects at all.** Query embedding; query length; entity popularity; base-LLM signals from a single parametric forward pass (max token probability and entropy of the first $k$ answer tokens — TARG-style prefix probe — answer length, "I don't know" indicator); and, added after the pilot, **ambiguity features**: subject-name character length, token count, single-token flag. The pilot's three genuine harm cases all had subjects of ≤6 characters, and subject length alone reached effect AUC 0.823.
+- **Tier F1 — cheap index lookups allowed.** Everything in F0 plus retriever-side signals. **Raw scores are not comparable across queries** — the pilot found `retr_top1` correlates r=0.70 with subject-name length, and residualising drops its effect AUC from 0.906 to 0.663 — so headline claims use *normalized* features: rank ratios ($(s_1-s_2)/s_1$, $\bar{s}/s_1$), coefficient of variation, z-score within query-length stratum, score residualised on subject and question length, and corpus-side ambiguity (fraction of top-$k$ titles matching the subject). Dense top-1 cosine joins this tier in Phase 2 and is more comparable by construction. These require an index search but *not* reading passages into the LLM context, where the dominant cost lies; cost accounting separates search from generation so the saving claim is precise.
 
 **Costs $c_a$.** Measured average context tokens and wall-clock latency per arm on the stated hardware, normalized to $[0,1]$. The policy objective is $Y - \lambda\,c_a$; we sweep $\lambda$ to trace the accuracy-vs-cost frontier rather than fixing a single cost.
 
@@ -136,9 +167,21 @@ Sizes (initial): 3,000 queries per dataset for the full-factorial calibration se
 
 - **Primary:** token-level F1 against gold aliases, $Y \in [0,1]$.
 - **Secondary:** exact match (for comparability with prior work) and a bounded LLM-judge score on a 500-query subset to check that F1-based conclusions hold under semantic scoring. The judge never sees the treatment assignment.
-- **Harm definition** for continuous $Y$: $\Delta_i = Y_i^{(1)} - Y_i^{(0)}$; "harmful" if $\Delta_i < -\delta$ with $\delta = 0.5$ (a clear flip), with sensitivity to $\delta \in \{0.25, 0.5, 0.75\}$ reported.
+- **Primary effect definition (revised after the pilot):** containment accuracy, $\Delta_i = Y_i^{(1),acc} - Y_i^{(0),acc} \in \{-1,0,1\}$; helped if $\Delta_i > 0$, harmed if $\Delta_i < 0$. A token-F1 threshold over-counted harm roughly 2× — four of seven negative-ΔF1 cases were scoring artifacts (arm 1 still containing gold but penalised for extra tokens, or both arms wrong sharing a token). F1-based harm at $\delta \in \{0.25,0.5,0.75\}$ is kept as a sensitivity table, and a **harm audit** classifies every negative case as a genuine flip or a named artifact type.
+- **Decision-live subset:** queries where the arms disagree. All headline effect AUCs are computed here, because `helped` requires arm 0 to be wrong and would otherwise be mechanically anti-predicted by any level predictor.
 
 Decoding: greedy for the main results; a temperature-0.7, 3-sample variant on a subset to demonstrate the estimators under genuinely stochastic outcomes.
+
+### 4.5a The dissociation analysis (Figure 1)
+
+For every pre-decision feature $x_j$, report with bootstrap CIs:
+
+- $\mathrm{AUC}_{\text{level}}(x_j) = \mathrm{AUC}(x_j \to Y^{(0)}\text{ correct})$ — what proxy gates implicitly target.
+- $\mathrm{AUC}_{\text{effect}}(x_j) = \mathrm{AUC}(x_j \to \text{helped})$ on the decision-live subset — what the decision requires.
+
+Plot features in this plane, coloured by tier (confidence / popularity / ambiguity / retrieval). The claim is a visible separation: confidence features sit bottom-right (informative about the level, uninformative about the effect), retrieval and ambiguity features top-left. Paired bootstrap on the AUC difference between the best confidence feature and the best retrieval feature gives the headline number. Report the same plane per dataset, per retriever tier, and per model, since the claim's generality is what makes it a contribution rather than an artifact of one setup.
+
+This is the empirical counterpart of Prop. 2 (§4.9): a gate thresholding $g(\mu_0)$ is optimal only if $\tau$ is monotone in $\mu_0$, and the dissociation is what that failure looks like in data.
 
 ### 4.5 Estimation of $\tau$
 
@@ -201,36 +244,39 @@ No new theorems are claimed; the novelty is the formulation and the empirical pr
 8. Compute the proxy-gate regret decomposition (harm incurred vs benefit forgone) for an uncertainty gate swept over thresholds. If the harmful fraction is non-trivial in any cell — expected on popular entities — the motivating figure exists. **Decision gate: proceed only if this holds; if not, switch to a smaller LLM where parametric knowledge is weaker and re-check.**
 
 ### Phase 2 — Full-factorial calibration set (week 2)
-9. Extend to 3,000 queries × 4 datasets × 2 arms (BM25 tier). Then the dense tier on the same queries.
-10. Extract F0 and F1 features for every query; freeze feature tables.
-11. Report per-dataset: mean $\Delta$, harm rate, help rate, and how they move from BM25 to dense.
+10. Extend to 3,000 queries × 4 datasets × 2 arms (BM25 tier). Then the dense tier on the same queries — this also tests whether the dissociation survives a better retriever, and dense cosines are more comparable across queries than BM25 scores.
+11. Extract F0 and F1 features for every query; freeze feature tables.
+12. Report per-dataset: mean $\Delta$, harm rate, help rate, decision-live fraction, and how each moves from BM25 to dense. Re-run the dissociation plane per tier.
 
 ### Phase 3 — Estimation and policy learning (weeks 3–4)
-12. Simulate the logged-bandit set by masking one arm per query at random ($e=0.5$); keep 200 masking seeds.
-13. Fit DR-, R-, X-, T-, S-learners and the two non-causal baselines on F0 and on F1; cross-fitting; calibration plots of $\hat\tau$ vs observed $\Delta$.
-14. Derive policies; compute accuracy-vs-cost frontiers against all baselines at matched retrieval rate; plot realized regret vs $n$ against the observed oracle.
-15. Transfer experiments across datasets.
+13. Simulate the logged-bandit set by masking one arm per query at random ($e=0.5$); keep 200 masking seeds.
+14. Fit DR-, R-, X-, T-, S-learners and the two non-causal baselines on F0 and on F1; cross-fitting; calibration plots of $\hat\tau$ vs observed $\Delta$.
+15. Derive policies; compute accuracy-vs-cost frontiers against all baselines at matched retrieval rate; plot realized regret vs $n$ against the observed oracle.
+16. Transfer experiments across datasets.
+17. **Uplift-RAG proxy baseline** (added after review feedback): score each retrieved document by estimated marginal uplift, keep the positive ones, and compare end-to-end against the decision-level policy on accuracy *and* cost. Expected framing is complementarity — document-level uplift still pays for retrieval on every query, which is exactly the cost a gate avoids.
 
 ### Phase 4 — OPE tool and validation (weeks 4–5)
-16. Implement DR / IPW / DM / SN-IPW estimators with bootstrap CIs as a small library with a one-call API: `evaluate(policy_fn, log) -> (value, ci)`.
-17. Reconstruct ~6 published-style gates from F0 features (prefix-entropy, max-prob, margin, popularity, complexity classifier, TARG-style) plus ~4 synthetic gates spanning retrieval rates.
-18. Validation figure: estimated vs true value, MAE, rank correlation, CI coverage over masking seeds; LLM-call cost comparison.
-19. Stochastic-outcome subset (temperature sampling) and judge-score subset; repeat validation.
+18. Implement DR / IPW / DM / SN-IPW estimators with bootstrap CIs as a small library with a one-call API: `evaluate(policy_fn, log) -> (value, ci)`.
+19. Reconstruct ~6 published-style gates from F0 features (prefix-entropy, max-prob, margin, popularity, complexity classifier, TARG-style) plus ~4 synthetic gates spanning retrieval rates.
+20. Validation figure: estimated vs true value, MAE, rank correlation, CI coverage over masking seeds; LLM-call cost comparison.
+21. Stochastic-outcome subset (temperature sampling) and judge-score subset; repeat validation. **Judge calibration:** the judge prompt must explicitly penalise unsupported additions drawn from the retrieved text, or it will reward the retrieval arm for sounding authoritative. Note the mirror-image bias in token-F1 found in the pilot (extra correct detail penalised) and report both.
+22. **CI width vs log size:** re-simulate logs at $n \in \{250, 500, 1000, 2000, \ldots\}$ over many maskings and plot OPE confidence-interval width against log size. "How much logged data distinguishes two gates?" is a result practitioners want, and it answers the underpowering concern directly.
 
 ### Phase 5 — Multi-arm extension (weeks 5–6)
-20. 1,000 queries per dataset × 9 arms (depths × retrievers × 2-round iterative). Full factorial for ground truth; simulated uniform logging.
-21. Multi-treatment DR-learner and multi-arm OPE; policy over arms; show OPE cost advantage scales with $|A|$.
-22. HotpotQA analysis: where the iterative arm has large positive $\tau$ and where it doesn't.
+23. 2,000 queries per dataset × **6 arms** (none / top-1 / top-5 / top-10 / 2-round iterative on the better retriever, plus one cross-retriever arm). Trimmed from 9 after review feedback: fewer arms at more queries per arm sharpens every comparison at the same compute. Full factorial for ground truth; simulated uniform logging at $1/|A|$.
+24. Multi-treatment DR-learner and multi-arm OPE; self-normalized IPW and DR rather than vanilla IPW; policy over arms; show the OPE cost advantage scales with $|A|$.
+25. HotpotQA analysis: where the iterative arm has large positive $\tau$ and where it doesn't.
 
-### Phase 6 — Second LLM, sensitivity, theory (week 7)
-23. Repeat Phases 2–4 core runs on Llama-3.1-8B-Instruct (smaller $n$ acceptable).
-24. Sensitivity: $\delta$, $\lambda$, $k$.
-25. Write the theory section (§4.9) and check Prop. 2's decomposition numerically against Phase 1 results.
+### Phase 6 — Second and third LLM, sensitivity, theory (week 7)
+26. Repeat Phases 2–4 core runs on Llama-3.1-8B-Instruct (smaller $n$ acceptable).
+27. Add a 1.5–3B model as a **capacity axis**, not as a fix for a thin harm map: show how the $\tau$ distribution and the dissociation shift as parametric knowledge shrinks. The pilot makes the direction non-obvious — smaller models are more distractible but are right in arm 0 less often, so harm *opportunities* fall even as per-opportunity susceptibility rises. Measuring which dominates is a contribution.
+28. Sensitivity: $\delta$, $\lambda$, $k$.
+29. Write the theory section (§4.9) and check Prop. 2's decomposition numerically against the Phase 1/2 results.
 
 ### Phase 7 — Paper, release, submission (weeks 8–10)
-26. Figures: (F1) harm map; (F2) proxy-gate regret decomposition; (F3) accuracy-vs-cost frontiers; (F4) $\hat\tau$ calibration; (F5) OPE estimated-vs-true with CIs; (F6) realized regret vs $n$; (F7) BM25 vs dense $\tau$ shift; (F8) multi-arm OPE cost scaling. Tables: dataset stats; estimator comparison; gate comparison via OPE and via truth; cost accounting. No figure re-plots a table.
-27. Release: code, logged datasets (features + arm + outcome + propensity), the OPE library, a notebook that reproduces every figure from the logs without a GPU.
-28. Limitations and ethics; reproducibility statement with hardware and seeds. Fresh-environment reproduction run before submission.
+30. Figures: **(F1) the dissociation plane**; (F2) effect maps (informative axes + contrast); (F3) proxy-gate regret decomposition; (F4) accuracy-vs-cost frontiers; (F5) $\hat\tau$ calibration; (F6) OPE estimated-vs-true with CIs; (F7) OPE CI width vs log size; (F8) realized regret vs $n$; (F9) BM25 vs dense $\tau$ shift; (F10) multi-arm OPE cost scaling. Tables: dataset stats with decision-live fractions; harm audit; estimator comparison; gate comparison via OPE and via truth; cost accounting. No figure re-plots a table.
+31. Release: code, logged datasets (features + arm + outcome + propensity), the OPE library, a notebook that reproduces every figure from the logs without a GPU.
+32. Limitations and ethics; reproducibility statement with hardware and seeds. Fresh-environment reproduction run before submission.
 
 ---
 
@@ -335,7 +381,10 @@ Estimates assume Qwen2.5-7B-Instruct in 4-bit, batched generation, prompts of ~6
 
 | Risk | Mitigation |
 |---|---|
-| Harm rate turns out negligible for the 7B model | Use a smaller LLM (weaker parametric knowledge makes effects more heterogeneous, not less); use the dense tier where distractors are more plausible; PopQA popular entities are the most likely harm region — check there first |
+| Harm rate turns out negligible | **Observed in the pilot (3/100).** The paper's claim is the dissociation, which does not require common harm. To raise the harm rate, change the *dataset* (TriviaQA, where arm 0 is often right), not the model — harm requires arm 0 to be correct first, so a smaller LLM reduces harm opportunities even though it is more distractible |
+| Reviewer: "the effect AUC is mechanically coupled to the level AUC" | Headline effect AUCs are computed on the decision-live subset, where `helped` and `harmed` partition the sample; full-sample AUCs in the appendix |
+| Reviewer: "BM25 score is not comparable across queries" | **True, and measured** (r=0.70 with subject length). Normalized features carry all headline claims; dense tier added; raw score reported for reference only |
+| Small decision-live subset makes CIs wide | Live fraction was 20% at pilot scale; scale-up targets ≥600 live queries per dataset. Report the live count next to every effect AUC |
 | Reviewer: "you can just run both arms" | §4.1 argument; multi-arm extension; single-arm deployment framing; stochastic-outcome subset; and the both-arms set is what *validates* the estimators |
 | Reviewer: "Adaptive-RAG with a different label" | Estimand (difference vs level), estimator (DR vs classifier), guarantees, OPE — plus the regret decomposition showing what the label misses |
 | Reviewer: "Uplift-RAG already did uplift" | Document-level reranking vs decision-level policy + OPE; cite and differentiate in one sentence |
@@ -349,7 +398,7 @@ Estimates assume Qwen2.5-7B-Instruct in 4-bit, batched generation, prompts of ~6
 
 ## 9. Limitations to state in the paper
 
-$\tau$ is a property of a (model, retriever, corpus, prompt) tuple, not of queries in the abstract; harm maps do not transfer across models without re-logging. OPE is valid for the logged action set and logged feature superset only, and for target queries from the logging distribution. Greedy decoding makes outcomes deterministic on benchmarks; the stochastic subset partially addresses this. English-only; short-answer QA; 7–8B open models. No claims about generation quality relative to larger LLMs.
+The dissociation is measured, not proven, and is a property of the setups tested; we report it per dataset, retriever tier, and model rather than claiming universality. Ambiguity features use PopQA's gold subject string where available and a capitalized-span heuristic elsewhere — a proxy, flagged as such. $\tau$ is a property of a (model, retriever, corpus, prompt) tuple, not of queries in the abstract; harm maps do not transfer across models without re-logging. OPE is valid for the logged action set and logged feature superset only, and for target queries from the logging distribution. Greedy decoding makes outcomes deterministic on benchmarks; the stochastic subset partially addresses this. English-only; short-answer QA; 7–8B open models. No claims about generation quality relative to larger LLMs.
 
 ---
 
@@ -368,3 +417,9 @@ $\tau$ is a property of a (model, retriever, corpus, prompt) tuple, not of queri
 | "Validate OPE on FLARE, DRAGIN, Adaptive-RAG" | **Refined** | Only *pre-generation* reconstructions of these gates are evaluable from logs; mid-generation triggers are arms, not gates (§4.7) |
 | "Finite-sample regret bounds bridge NLP and learning theory" | **Adopted as stated-and-checked, not derived** | Bounds are imported (Kitagawa–Tetenov; Athey–Wager); we check them empirically against the observed oracle |
 | Claim of "foundational reference" impact | **Not written into the paper** | Let reviewers decide; overclaiming is how the previous project got rejected |
+| Lead with the harm map as the narrative hook | **Rejected after the pilot** | 3/100 genuine harm cases and both designed axes flat. The dissociation is the stronger and more robust hook |
+| Make a 1.5–3B model mandatory to get a more dramatic harm map | **Repurposed** | The arithmetic runs the other way: harm needs arm 0 correct, and smaller models are correct less often. Kept as a capacity axis, not as the fix |
+| Phase 5 underpowered at 1,000 queries / 9 arms ("~111 per arm") | **Adopted in substance, corrected in detail** | The calibration set is full-factorial, so every arm is observed for every query and no propensity weighting applies there; the 1/9 weights appear only in the simulated log. Still trimmed to 6 arms at 2,000 queries, added SN-IPW/DR, and added CI-width-vs-log-size as a headline result |
+| Add an Uplift-RAG proxy baseline | **Adopted** | Reviewer 2 will ask; scoped as document-level uplift vs decision-level policy on accuracy *and* cost (Phase 3, item 17) |
+| Judge must penalise hallucinated additions | **Adopted** | Phase 4, item 21, with the mirror-image F1 bias found in the pilot reported alongside |
+| Use n8n / Docling to orchestrate corpus processing | **Rejected** | The corpus is pre-chunked and pre-indexed in Pyserini's `wikipedia-dpr-100w`; Docling solves document parsing, which is not the bottleneck. An orchestration layer would be a reproducibility liability — reviewers can run a pip-installable package and a notebook, not an n8n instance |
