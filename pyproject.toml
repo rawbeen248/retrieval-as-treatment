@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rat"
+version = "0.1.0"
+description = "Retrieval as Treatment: causal effect estimation and off-policy evaluation for adaptive RAG"
+requires-python = ">=3.10"
+# Runtime dependencies are installed from requirements.txt (Colab already ships torch);
+# keeping them out of here makes `pip install -e .` instant and avoids resolver fights.
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["rat*"]

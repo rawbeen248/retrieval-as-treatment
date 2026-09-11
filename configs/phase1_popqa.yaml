@@ -1,0 +1,31 @@
+# Phase 1 — harm map on PopQA. Every value can be overridden from the notebook:
+#   cfg = load_config(WORKDIR, path=..., n_queries=500)
+dataset: popqa
+n_queries: 2000
+seed: 42
+pop_bins: 5              # popularity strata for sampling AND harm-map rows
+
+# LLM (arm 0 = parametric, arm 1 = parametric + passages)
+model_name: Qwen/Qwen2.5-7B-Instruct
+# Drop-in faster alternative (pre-quantized, ~5.5 GB download instead of ~15 GB):
+#   model_name: unsloth/Qwen2.5-7B-Instruct-bnb-4bit
+model_revision: null
+load_in_4bit: true
+batch_size: 8
+max_new_tokens: 32
+max_prompt_tokens: 2048
+max_passage_words: 120
+prefix_k: 3              # first-k answer tokens used for the confidence probe
+
+# Retrieval (treatment definition: inject top_k passages from this retriever)
+retriever: bm25
+index_name: wikipedia-dpr-100w
+n_retrieve: 10           # cached per query; top_k <= n_retrieve is injected
+top_k: 5
+search_threads: 8
+pyserini_cache_local: /content/pyserini_cache
+
+# Analysis
+delta_thresholds: [0.25, 0.5, 0.75]
+harm_thr: 0.5
+conf_bins: 5
