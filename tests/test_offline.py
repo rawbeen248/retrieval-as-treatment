@@ -16,7 +16,9 @@ from rat import analysis, score  # noqa: E402
 from rat.config import load_config  # noqa: E402
 from rat.data import _parse_answers, sample_stratified  # noqa: E402
 from rat.features import ambiguity_feats, build_feature_table, subject_of  # noqa: E402
-from rat.dissociation import auc, boot_auc_diff, dissociation_table, headline_contrast  # noqa: E402
+from rat.dissociation import (  # noqa: E402
+    arm_decomposition, auc, crossfit_tau, dissociation_statistic, policy_value, tau_evaluation,
+)
 from rat.generate import build_messages, clean_answer, idk_flag, truncate_words  # noqa: E402
 from rat.logs import JsonlStore  # noqa: E402
 from rat.retrieve import CachedJsonlRetriever, _parse_raw  # noqa: E402
@@ -124,27 +126,49 @@ def test_ambiguity_helpers():
     assert "Dollhouse" in got
 
 
-def test_dissociation_recovers_ground_truth():
-    """Confidence must look strong on the level and flat on the effect; the
-    retrieval feature the reverse. This is the paper's claim, on synthetic data."""
+def test_arm_decomposition_recovers_ground_truth():
+    """Confidence must attach to arm 0, retrieval to arm 1, orientation-invariantly."""
     data, g0, g1, retr = _synthetic_feat(n=800, seed=3)
     feat = build_feature_table(data, g0, g1, retr, top_k=5)
-    d = dissociation_table(feat, n_boot=200).set_index("feature")
-    # confidence owns the level; retrieval owns the effect on the decision-live subset
-    assert d.loc["probe_maxprob_mean", "auc_level"] > 0.65
-    assert abs(d.loc["retr_top1", "auc_level"] - 0.5) < 0.12
-    assert d.loc["retr_top1", "auc_effect_live"] > 0.70
-    assert (abs(d.loc["retr_top1", "auc_effect_live"] - 0.5)
-            > abs(d.loc["probe_maxprob_mean", "auc_effect_live"] - 0.5))
-    assert d["n_live"].iloc[0] == int(((feat["delta_acc"] != 0)).sum())
-    h = headline_contrast(feat, n_boot=200)
-    assert h["diff_on_effect"]["p_gt_0"] > 0.95
-    assert "live only" in h["diff_on_effect"]["target"]
-    # AUC sanity: perfect and inverted predictors
-    y = np.array([0, 0, 1, 1]); assert auc(np.array([1, 2, 3, 4]), y) == 1.0
-    assert auc(np.array([4, 3, 2, 1]), y) == 0.0
-    bd = boot_auc_diff(feat, "retr_top1", "probe_maxprob_mean", "helped", n_boot=100)
-    assert bd["diff"] > 0 and bd["lo"] < bd["hi"]
+    a = arm_decomposition(feat, n_boot=200).set_index("feature")
+    assert a.loc["probe_maxprob_mean", "auc_Y0"] > 0.65      # knows the parametric arm
+    assert a.loc["probe_maxprob_mean", "D"] < 0              # ...more than the retrieval arm
+    assert a.loc["retr_top1", "auc_Y1"] > 0.65               # knows the retrieval arm
+    assert a.loc["retr_top1", "D"] > 0
+    # inverted features must not flip sign: entropy is confidence upside down
+    assert a.loc["probe_entropy_mean", "D"] < 0
+    assert abs(a.loc["probe_entropy_mean", "D"] - a.loc["probe_maxprob_mean", "D"]) < 0.1
+    st = dissociation_statistic(feat, n_boot=200)
+    assert st["diff"] > 0 and st["lo"] > 0 and st["p_gt_0"] > 0.95
+    assert auc(np.array([1, 2, 3, 4]), np.array([0, 0, 1, 1])) == 1.0
+    assert auc(np.array([4, 3, 2, 1]), np.array([0, 0, 1, 1])) == 0.0
+
+
+def test_no_circular_target_used():
+    """Guard against the two traps: neither `helped` over all queries nor over the
+    decision-live subset may be used as a prediction target anywhere."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "rat", "dissociation.py")).read()
+    body = src.split('"""', 2)[2]          # skip the module docstring, which discusses them
+    assert "helped" not in body, "dissociation.py must not predict `helped`"
+    # and the identity that makes it circular, demonstrated:
+    data, g0, g1, retr = _synthetic_feat(n=400, seed=5)
+    feat = build_feature_table(data, g0, g1, retr, top_k=5)
+    live = feat["delta_acc"] != 0
+    assert (feat.loc[live, "helped"] == (1 - feat.loc[live, "y0_acc"])).all()
+
+
+def test_tau_evaluation_prefers_informative_features():
+    data, g0, g1, retr = _synthetic_feat(n=800, seed=11)
+    feat = build_feature_table(data, g0, g1, retr, top_k=5)
+    tbl, ref = tau_evaluation(feat, n_boot=100)
+    assert ref["never_retrieve"] <= ref["oracle"] and ref["always_retrieve"] <= ref["oracle"]
+    v = tbl.set_index("feature_set")["V@50%"]
+    assert v["all F0 + F1"] >= v["popularity only"]
+    tau = crossfit_tau(feat, ["retr_top1", "subj_chars"], seed=0)
+    assert len(tau) == len(feat) and np.std(tau) > 0
+    # policy value must be monotone in oracle terms at the extremes
+    assert abs(policy_value(feat, tau, 0.0) - feat["y0_acc"].mean()) < 1e-9
+    assert abs(policy_value(feat, tau, 1.0) - feat["y1_acc"].mean()) < 1e-9
 
 
 def test_features_and_gate_identity():
@@ -174,11 +198,16 @@ def test_run_analysis_end_to_end():
                                     {"torch": "x"}, {"stratified": True}, os.path.join(d, "res"), os.path.join(d, "fig"),
                                     n_boot=100)
         assert os.path.exists(os.path.join(d, "res", "report.md"))
-        assert os.path.exists(os.path.join(d, "res", "dissociation.csv"))
-        for f in ("dissociation.png", "effect_map_informative.png", "effect_map_contrast.png", "gate_regret.png"):
+        assert os.path.exists(os.path.join(d, "res", "arm_decomposition.csv"))
+        assert os.path.exists(os.path.join(d, "res", "tau_evaluation.csv"))
+        for f in ("arm_plane.png", "tau_evaluation.png", "effect_map_informative.png",
+                  "effect_map_contrast.png", "gate_regret.png"):
             assert os.path.exists(os.path.join(d, "fig", f)), f
         r = out["report"]
-        for section in ("Headline", "Decision gate", "Effect maps", "Harm audit", "Flip table"):
+        for section in ("which arm does each signal know about", "cross-fitted tau", "Decision gate",
+                        "Effect maps", "Harm audit", "Flip table", "Regime"):
+            assert section.lower() in r.lower(), section
+        for section in ():
             assert section in r, section
         assert out["summary"]["stats"]["flips"]["helped"] > 0
 

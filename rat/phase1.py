@@ -203,29 +203,47 @@ def write_combined(cfg: Config, results: Dict[str, dict]) -> str:
     for name, r in results.items():
         s = r["summary"]["stats"]
         fl = s["flips"]
-        h = r["summary"].get("headline") or {}
+        st = r["summary"].get("dissociation_statistic") or {}
+        rg = r["summary"].get("regime") or {}
+        rf = r["summary"].get("reference") or {}
         rows.append({
             "dataset": name, "n": s["acc"]["n"],
             "Y0_acc": round(s["acc"]["y0_mean"], 3), "Y1_acc": round(s["acc"]["y1_mean"], 3),
-            "mean_delta": round(s["acc"]["delta_mean"], 3),
-            "helped": fl["helped"], "harmed": fl["harmed"],
-            "both_right": fl["both_right"], "both_wrong": fl["both_wrong"],
+            "helped": fl["helped"], "harmed": fl["harmed"], "both_wrong": fl["both_wrong"],
             "decision_live": round(fl["decision_live_frac"], 3),
-            "conf_AUC_level": round((h.get("conf_level") or {}).get("auc", float("nan")), 3),
-            "conf_AUC_effect": round((h.get("conf_effect") or {}).get("auc", float("nan")), 3),
-            "retr_AUC_effect": round((h.get("retr_effect") or {}).get("auc", float("nan")), 3),
+            "oracle": round(rf.get("oracle", float("nan")), 3),
+            "headroom_over_always": round(rf.get("headroom_over_always", float("nan")), 3),
+            "D_conf": round(st.get("D_conf", float("nan")), 3),
+            "D_retr": round(st.get("D_retr", float("nan")), 3),
+            "D_diff": round(st.get("diff", float("nan")), 3),
+            "D_lo": round(st.get("lo", float("nan")), 3),
+            "D_hi": round(st.get("hi", float("nan")), 3),
+            "regime": rg.get("regime", ""),
+            "V50_conf_only": round(rg.get("V50_confidence_only", float("nan")), 3),
+            "V50_retr_only": round(rg.get("V50_retrieval_only", float("nan")), 3),
+            "winner@50%": rg.get("winner_at_50pct", ""),
         })
-        d = r.get("dissociation")
-        if d is not None and len(d):
-            dd = d.copy(); dd.insert(0, "dataset", name); diss_rows.append(dd)
+        for key, fname in (("arms", "arm_decomposition"), ("tau", "tau_evaluation")):
+            d = r.get(key)
+            if d is not None and len(d):
+                dd = d.copy(); dd.insert(0, "dataset", name)
+                diss_rows.append((fname, dd))
     tbl = _pd.DataFrame(rows)
     tbl.to_csv(os.path.join(cdir, "cross_dataset.csv"), index=False)
-    if diss_rows:
-        _pd.concat(diss_rows).to_csv(os.path.join(cdir, "dissociation_all.csv"), index=False)
+    for fname in {f for f, _ in diss_rows}:
+        _pd.concat([d for f, d in diss_rows if f == fname]).to_csv(
+            os.path.join(cdir, f"{fname}_all.csv"), index=False)
     text = ("# Phase 1 — cross-dataset summary\n\n"
             + analysis.md_table(tbl, index=False)
-            + "\n\nRead this first: `harmed` needs to be large enough to model, and the gap between "
-              "`conf_AUC_level` and `conf_AUC_effect` is the paper's headline claim.\n")
+            + "\n\n**How to read this.**\n"
+              "- `D_conf` / `D_retr` = AUC(Y1) − AUC(Y0) for the best confidence and retrieval feature. "
+              "Confidence should be negative (knows the parametric arm), retrieval positive (knows the "
+              "retrieval arm). `D_diff` with a CI excluding 0 is the structural claim.\n"
+              "- `winner@50%` is which family actually drives a better decision at a 50% budget. "
+              "If it differs across datasets, the regime claim holds: no fixed proxy is right everywhere, "
+              "which is the argument for estimating tau.\n"
+              "- `harmed` and `decision_live` say whether there is enough signal to model at all; "
+              "`headroom_over_always` is how much a perfect gate could win.\n")
     with open(os.path.join(cdir, "summary.md"), "w") as f:
         f.write(text)
     print(f"[combined] -> {os.path.join(cdir, 'summary.md')}")

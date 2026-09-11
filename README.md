@@ -7,15 +7,29 @@ Reproducibility package for the plan in `docs/RESEARCH_PLAN.md`.
 
 ## The claim Phase 1 tests
 
-> Signals the adaptive-RAG literature gates on — LLM confidence, entity popularity — predict **whether the model is wrong**. They do not predict **whether retrieving will help**. Other pre-decision signals do.
+The decision quantity is `tau(x) = mu1(x) - mu0(x)`: the change in correctness caused by retrieving. Phase 1 asks two questions, both answerable because **both arms are observed for every query**:
 
-If that holds, every confidence-thresholded gate is optimising a proxy for the wrong quantity, which is the opening argument of the paper.
+1. **Structural.** Which arm does each pre-decision signal know about? Confidence should attach to the parametric arm, retrieval scores to the retrieval arm. Neither alone determines `tau`.
+2. **Decision-relevant.** Does a cross-fitted `tau_hat` from each feature set actually drive a better retrieval decision at matched budget than the single-proxy gates in the literature?
+
+> **The regime finding (n=300 × 2):** which family of signals wins *flips by dataset*. On PopQA the model is at a floor (Y⁰=0.17), so `mu0` barely varies, `tau ≈ mu1`, and retrieval signals win. On TriviaQA the model is competent (Y⁰=0.56), `mu0` varies, and confidence wins. No fixed proxy is correct across regimes — which is the argument for estimating `tau` rather than thresholding a proxy.
+
+## Two circular targets, and why neither is used
+
+Documented because both were implemented and both had to be thrown out:
+
+- `AUC(feature -> helped)` over all queries: `helped` requires arm 0 to be wrong, so any predictor of the level anti-predicts it for free.
+- `AUC(feature -> helped)` on the **decision-live** subset: worse. With binary outcomes, "the arms disagree" means exactly one is right, so on that subset `helped` is *identically* `1 - Y0`. It is the level wearing a disguise. Verified on both datasets.
+
+Everything reported is measured against `Y0`, `Y1`, or `Delta` directly. `tests/test_offline.py::test_no_circular_target_used` fails if `helped` reappears as a target.
+
+Separation uses `|AUC - 0.5|`, not raw AUC: features like entropy point downward by construction, and a raw difference would misread them as knowing the retrieval arm.
 
 ## What changed after the pilot (n=100, PopQA, Qwen2.5-7B)
 
 | pilot finding | change |
 |---|---|
-| Confidence: AUC 0.844 on the level, 0.444 on the effect. BM25 top-1: 0.906 on the effect. | The **dissociation** is now the headline analysis (`rat/dissociation.py`), with bootstrap CIs and a paired bootstrap contrast. The harm map is demoted to support. |
+| Confidence tracks the parametric arm; retrieval scores track the retrieval arm. | **Arm decomposition** + **cross-fitted tau evaluation** are the headline analyses (`rat/dissociation.py`), with bootstrap CIs and a paired dissociation statistic. The harm map is demoted to support. |
 | Only 3/100 genuine harm cases; both designed map axes flat. | Effect maps now use **retrieval score × ambiguity** as the informative axes, keeping **confidence × popularity** as an explicit contrast figure. Cells with n < 20 are suppressed. |
 | All 3 harm cases were short polysemous names (`Idaho`, `Summit`, `X`). | Added **ambiguity features**: subject length, token count, single-token flag, plus corpus-side title-match features. |
 | Raw BM25 top-1 correlates r≈0.70 with subject-name length; residualised AUC falls 0.906 → 0.663. | Added **normalized retrieval features** (rank ratios, CV, z-within-query-length, residualised score). Raw score kept for reference only. |
@@ -48,7 +62,7 @@ python scripts/run_phase1.py --workdir ... --skip-generation    # rebuild report
 1. `results/phase1_combined/summary.md` — cross-dataset table
 2. `results/phase1/<dataset>/report.md` (both datasets)
 3. `results/phase1/<dataset>/features_binned.parquet` (both)
-4. `figures/phase1/<dataset>/dissociation.png`
+4. `figures/phase1/<dataset>/arm_plane.png` and `tau_evaluation.png`
 
 ## Layout
 
@@ -61,7 +75,7 @@ rat/
   score.py         token-F1 / EM / containment accuracy
   logs.py          resumable JSONL store
   features.py      F0 (confidence, popularity, ambiguity) + F1 (raw & normalized retrieval)
-  dissociation.py  level-vs-effect AUCs, bootstrap CIs, paired contrasts   <-- headline
+  dissociation.py  arm decomposition, cross-fitted tau, policy value       <-- headline
   analysis.py      effect maps, flip table, harm audit, gate regret, report
   phase1.py        orchestration; run_datasets() across datasets + combined summary
 configs/phase1.yaml
@@ -79,10 +93,11 @@ WORKDIR/
   retrievals/                <dataset>__bm25__k10.jsonl
   logs/gen/                  <dataset>__<model>__arm0.jsonl, ...__bm25_top5__arm1.jsonl
   features/                  joined feature/outcome tables
-  results/phase1/<dataset>/  report.md, summary.json, dissociation.csv, harm_audit.csv,
-                             gate_curve_*.csv, features_binned.parquet, versions.json
-  results/phase1_combined/   summary.md, cross_dataset.csv, dissociation_all.csv
-  figures/phase1/<dataset>/  dissociation.png, effect_map_informative.png,
+  results/phase1/<dataset>/  report.md, summary.json, arm_decomposition.csv, tau_evaluation.csv,
+                             harm_audit.csv, gate_curve_*.csv, features_binned.parquet, versions.json
+  results/phase1_combined/   summary.md, cross_dataset.csv, arm_decomposition_all.csv,
+                             tau_evaluation_all.csv
+  figures/phase1/<dataset>/  arm_plane.png, tau_evaluation.png, effect_map_informative.png,
                              effect_map_contrast.png, marginals.png, gate_regret.png, delta_hist.png
   pyserini_cache/            persisted BM25 index
 ```
@@ -91,11 +106,15 @@ WORKDIR/
 
 - Primary effect: `delta_acc = Y1_acc − Y0_acc` (containment). `helped` = Δ>0, `harmed` = Δ<0.
 - Continuous outcome: token-F1, max over gold aliases. Reported, but not used to define harm.
-- Decision-live: the arms disagree — the only queries a gate can affect.
+- Decision-live: the arms disagree — the only queries a gate can affect. Reported as a diagnostic, never used as a prediction target (see above).
+- `D = |AUC(Y1) - 0.5| - |AUC(Y0) - 0.5|`: how much more a feature knows about the retrieval arm than the parametric one.
 - Gate regret = oracle value − gate value = harm incurred + benefit forgone (exact identity, tested).
 
 ## Troubleshooting
 
+- **`ImportError: bitsandbytes ... requires bitsandbytes>=0.46.1`** → `pip install -U "bitsandbytes>=0.46.1"`, then Runtime → Restart, continue from cell 3.
+- **`ModuleNotFoundError: No module named 'pyserini'`** → the quiet install failed; re-run `pip install pyserini` without `-q` and read the error.
+- **`NameError: name 'phase1' is not defined`** → you restarted the runtime; re-run cell 3 first.
 - **`ImportError: cannot import name '_Ink' from 'PIL._typing'`** → `pip install -q --force-reinstall --no-deps "pillow>=11.3,<12"`, then Runtime → Restart, continue from cell 3.
 - **`java not found` / version < 21** → re-run the deps cell; Pyserini needs Java 21.
 - **Prebuilt index name error** → the message lists available Wikipedia indexes; set `index_name` in the config.

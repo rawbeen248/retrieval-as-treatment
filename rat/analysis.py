@@ -1,7 +1,7 @@
 """Phase 1 analysis.
 
-Restructured after the pilot (n=100, PopQA, Qwen2.5-7B):
-  1. HEADLINE  level-vs-effect dissociation (rat/dissociation.py)
+Restructured after the n=300 x 2 run:
+  1. HEADLINE  arm decomposition + tau evaluation (rat/dissociation.py)
   2. SUPPORT   effect maps -- the informative axes (retrieval score x ambiguity)
                AND the literature's axes (confidence x popularity) as a contrast
   3. SUPPORT   flip table, harm audit, proxy-gate regret decomposition
@@ -28,7 +28,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from .dissociation import DEFAULT_FEATURES, dissociation_table, headline_contrast  # noqa: E402
+from .dissociation import (  # noqa: E402
+    arm_decomposition, dissociation_statistic, regime_diagnostic, tau_evaluation,
+)
 
 OUTCOMES = ("f1", "em", "acc")
 MIN_CELL_N = 20  # pilot lesson: a "0.33 harm rate" from n=3 is noise, not a finding
@@ -206,83 +208,108 @@ def summary_stats(feat: pd.DataFrame, thresholds) -> dict:
     return s
 
 
-def decision_verdict(stats: dict, diss: pd.DataFrame, head: dict) -> str:
-    """Pilot lesson: the go/no-go should key on the dissociation (the paper's
-    actual claim), not on a harm rate computed from a handful of queries."""
+def decision_verdict(stats: dict, arms: pd.DataFrame, stat: dict, tau_tbl: pd.DataFrame,
+                     ref: dict, regime: dict) -> str:
     L = []
     fl = stats["flips"]
     n = stats["acc"]["n"]
     L.append(f"Flips: {fl['helped']} helped, {fl['harmed']} harmed, {fl['both_right']} both right, "
              f"{fl['both_wrong']} both wrong (n = {n}). Decision is live on "
-             f"{100 * fl['decision_live_frac']:.0f}% of queries.")
+             f"{100 * fl['decision_live_frac']:.0f}% of queries. "
+             f"Oracle headroom over always-retrieve: {ref['headroom_over_always']:+.3f}.")
 
-    eff_ok = diss[diss["effect_informative"]] if len(diss) else pd.DataFrame()
-    conf_rows = diss[diss["tier"] == "F0-confidence"] if len(diss) else pd.DataFrame()
-    conf_effect_flat = bool(len(conf_rows)) and not conf_rows["effect_informative"].any()
-    conf_level_ok = bool(len(conf_rows)) and conf_rows["level_informative"].any()
+    sep_ok = bool(len(arms)) and bool(arms["separated"].any())
+    stat_ok = bool(stat) and np.isfinite(stat.get("lo", np.nan)) and (stat["lo"] > 0 or stat["hi"] < 0)
+    if stat_ok:
+        L.append(f"Dissociation statistic: {stat['diff']:+.3f} [{stat['lo']:+.3f}, {stat['hi']:+.3f}] — "
+                 "confidence and retrieval signals attach to different arms.")
 
-    if head:
-        ce, cl = head.get("conf_effect", {}), head.get("conf_level", {})
-        re_, rl = head.get("retr_effect", {}), head.get("retr_level", {})
-        L.append(f"Headline: `{head['conf_feature']}` -> level AUC {cl.get('auc', float('nan')):.3f} "
-                 f"[{cl.get('lo', float('nan')):.3f}, {cl.get('hi', float('nan')):.3f}], "
-                 f"effect AUC {ce.get('auc', float('nan')):.3f} "
-                 f"[{ce.get('lo', float('nan')):.3f}, {ce.get('hi', float('nan')):.3f}].")
-        L.append(f"           `{head['retr_feature']}` -> level AUC {rl.get('auc', float('nan')):.3f} "
-                 f"[{rl.get('lo', float('nan')):.3f}, {rl.get('hi', float('nan')):.3f}], "
-                 f"effect AUC {re_.get('auc', float('nan')):.3f} "
-                 f"[{re_.get('lo', float('nan')):.3f}, {re_.get('hi', float('nan')):.3f}].")
-        d = head.get("diff_on_effect", {})
-        L.append(f"           Paired bootstrap, retrieval − confidence on the effect: "
-                 f"{d.get('diff', float('nan')):+.3f} [{d.get('lo', float('nan')):+.3f}, {d.get('hi', float('nan')):+.3f}], "
-                 f"P(diff > 0) = {d.get('p_gt_0', float('nan')):.3f}.")
+    best = tau_tbl.iloc[0] if len(tau_tbl) else None
+    single = tau_tbl[tau_tbl["n_features"] == 1]
+    best_single = single["V@50%"].max() if len(single) else float("nan")
+    beats_proxy = bool(best is not None and np.isfinite(best_single) and best["V@50%"] > best_single)
+    if best is not None:
+        L.append(f"Best feature set at a 50% budget: **{best['feature_set']}** "
+                 f"(V = {best['V@50%']:.3f}); best single-feature proxy gate: {best_single:.3f}; "
+                 f"always-retrieve: {ref['always_retrieve']:.3f}.")
 
-    strong = bool(len(eff_ok)) and float((eff_ok["auc_effect"] - 0.5).abs().max()) >= 0.15
-    if strong and conf_effect_flat and conf_level_ok:
-        L.append("**Verdict: PROCEED — dissociation confirmed.** Confidence predicts the level but not the "
-                 "effect, while other pre-decision signals predict the effect. That is the paper's thesis, "
-                 "and it does not depend on retrieval harm being common.")
-    elif strong:
-        L.append("**Verdict: PROCEED.** At least one pre-decision signal predicts the effect well. Check whether "
-                 "confidence is genuinely flat on the effect before writing the dissociation as the headline.")
+    if stat_ok and beats_proxy:
+        L.append("**Verdict: PROCEED.** The two signal families attach to different arms, and combining them "
+                 "beats every single-proxy gate at matched budget. That is the argument for estimating tau "
+                 "rather than thresholding a proxy.")
+    elif stat_ok:
+        L.append("**Verdict: PROCEED with care.** The structural dissociation holds, but the combined feature set "
+                 "does not yet beat the best single proxy on policy value — likely an n problem. Scale up before "
+                 "drawing conclusions about which gate wins.")
     elif fl["harmed"] >= max(20, 0.05 * n):
-        L.append("**Verdict: PROCEED on harm.** No signal predicts the effect yet, but harm is common enough that "
-                 "CATE estimation has something to fit. Expect a harder paper.")
+        L.append("**Verdict: PROCEED on harm.** No clean arm separation yet, but harm is frequent enough that "
+                 "CATE estimation has something to fit.")
     else:
-        L.append("**Verdict: RE-CHECK.** Neither a dissociation nor substantial harm. Most likely the dataset is "
-                 "one where retrieval almost always helps (PopQA long tail) — add TriviaQA/NQ-open, where the model "
-                 "knows more and retrieval has something to lose, before changing the model.")
-    if n < 300:
-        L.append(f"_Pilot size (n = {n}): treat every per-cell rate as indicative only. Cells with n < {MIN_CELL_N} "
-                 "are suppressed in the maps below._")
+        L.append("**Verdict: RE-CHECK.** Neither arm separation nor substantial harm. Check the retriever tier "
+                 "and the dataset before changing the model.")
+
+    if regime:
+        L.append(f"_Regime: {regime['regime']}. Which family wins is expected to flip between regimes; "
+                 "running both a model-limited and a corpus-limited dataset is what makes that visible._")
+    if n < 500:
+        L.append(f"_n = {n}: indicative only. Cells with n < {MIN_CELL_N} are suppressed in the maps below._")
     return "\n\n".join(L)
 
 
 # ---------------------------------------------------------------- plotting
-def plot_dissociation(diss: pd.DataFrame, path: str) -> None:
-    if diss.empty:
+def plot_arm_plane(arms: pd.DataFrame, path: str) -> None:
+    """Each feature placed by what it knows about arm 0 vs arm 1."""
+    if arms is None or arms.empty:
         return
-    d = diss.copy()
-    colors = {"F0-confidence": "#c0392b", "F0-popularity": "#e67e22", "F0-ambiguity": "#8e44ad", "F1-retrieval": "#2471a3"}
-    fig, ax = plt.subplots(figsize=(7.5, 6.5))
-    for _, r in d.iterrows():
+    colors = {"F0-confidence": "#c0392b", "F0-popularity": "#e67e22",
+              "F0-ambiguity": "#8e44ad", "F1-retrieval": "#2471a3"}
+    fig, ax = plt.subplots(figsize=(7.6, 6.6))
+    for _, r in arms.iterrows():
         c = colors.get(r["tier"], "grey")
-        ax.errorbar(r["auc_level"], r["auc_effect"],
-                    xerr=[[max(0, r["auc_level"] - r["level_lo"])], [max(0, r["level_hi"] - r["auc_level"])]],
-                    yerr=[[max(0, r["auc_effect"] - r["effect_lo"])], [max(0, r["effect_hi"] - r["auc_effect"])]],
+        ax.errorbar(r["auc_Y0"], r["auc_Y1"],
+                    xerr=[[max(0, r["auc_Y0"] - r["Y0_lo"])], [max(0, r["Y0_hi"] - r["auc_Y0"])]],
+                    yerr=[[max(0, r["auc_Y1"] - r["Y1_lo"])], [max(0, r["Y1_hi"] - r["auc_Y1"])]],
                     fmt="o", color=c, ms=6, capsize=2, lw=1, alpha=0.85)
-        ax.annotate(r["feature"], (r["auc_level"], r["auc_effect"]), fontsize=7,
-                    xytext=(4, 4), textcoords="offset points")
-    ax.axhline(0.5, color="grey", lw=0.8, ls="--")
-    ax.axvline(0.5, color="grey", lw=0.8, ls="--")
-    lim = (0.2, 1.0)
-    ax.plot(lim, lim, color="lightgrey", lw=0.8, zorder=0)
+        ax.annotate(r["feature"], (r["auc_Y0"], r["auc_Y1"]), fontsize=7, xytext=(4, 4), textcoords="offset points")
+    lim = (0.0, 1.0)
+    ax.plot(lim, lim, color="lightgrey", lw=0.9, zorder=0)
+    ax.axhline(0.5, color="grey", lw=0.7, ls="--"); ax.axvline(0.5, color="grey", lw=0.7, ls="--")
     ax.set_xlim(*lim); ax.set_ylim(*lim)
-    ax.set_xlabel("AUC predicting the LEVEL (arm-0 correct)")
-    ax.set_ylabel("AUC predicting the EFFECT (retrieval helped)")
-    ax.set_title("Level-vs-effect dissociation\n(gates threshold the x-axis; the decision needs the y-axis)")
-    handles = [plt.Line2D([], [], marker="o", ls="", color=v, label=k) for k, v in colors.items()]
-    ax.legend(handles=handles, fontsize=8, loc="lower left")
+    ax.set_xlabel("AUC predicting arm 0 (parametric answer correct)")
+    ax.set_ylabel("AUC predicting arm 1 (retrieval answer correct)")
+    ax.set_title("Which arm does each signal know about?\nAbove the diagonal: knows the retrieval arm better")
+    ax.legend(handles=[plt.Line2D([], [], marker="o", ls="", color=v, label=k) for k, v in colors.items()],
+              fontsize=8, loc="lower right")
+    fig.tight_layout(); fig.savefig(path, dpi=150); plt.close(fig)
+
+
+def plot_tau_eval(tau_tbl: pd.DataFrame, ref: dict, path: str) -> None:
+    if tau_tbl is None or tau_tbl.empty:
+        return
+    rate_cols = [c for c in tau_tbl.columns if c.startswith("V@") and c.endswith("%")]
+    rates = [int(c[2:-1]) / 100 for c in rate_cols]
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4))
+    ax = axes[0]
+    for _, r in tau_tbl.iterrows():
+        style = "--" if r["n_features"] == 1 else "-"
+        ax.plot(rates, [r[c] for c in rate_cols], style, marker="o", ms=4, lw=1.4, label=str(r["feature_set"]))
+    ax.axhline(ref["oracle"], color="black", ls=":", lw=1, label="oracle")
+    ax.axhline(ref["always_retrieve"], color="grey", ls="-.", lw=1, label="always retrieve")
+    ax.axhline(ref["never_retrieve"], color="grey", ls=":", lw=1, label="never retrieve")
+    ax.set_xlabel("retrieval rate"); ax.set_ylabel("realized value")
+    ax.set_title("policy value by feature set"); ax.legend(fontsize=6.5, ncol=1)
+    ax = axes[1]
+    d = tau_tbl[tau_tbl["corr_tau_delta"].notna()].sort_values("corr_tau_delta")
+    y = np.arange(len(d))
+    err = np.zeros((2, len(d)))
+    has = d["corr_lo"].notna().to_numpy()
+    err[0, has] = (d["corr_tau_delta"] - d["corr_lo"]).to_numpy()[has]
+    err[1, has] = (d["corr_hi"] - d["corr_tau_delta"]).to_numpy()[has]
+    ax.barh(y, d["corr_tau_delta"], xerr=err, color=["grey" if k == 1 else "steelblue" for k in d["n_features"]],
+            capsize=3)
+    ax.set_yticks(y); ax.set_yticklabels(d["feature_set"], fontsize=7)
+    ax.axvline(0, color="black", lw=0.8)
+    ax.set_xlabel("corr(tau_hat, observed Δ)"); ax.set_title("effect-prediction quality")
     fig.tight_layout(); fig.savefig(path, dpi=150); plt.close(fig)
 
 
@@ -403,10 +430,11 @@ def examples_table(feat: pd.DataFrame, n: int, helpful: bool) -> str:
 
 
 def write_report(path: str, cfg_dict: dict, versions: dict, data_meta: dict, bin_meta: dict, stats: dict,
-                 diss: pd.DataFrame, head: dict, maps: Dict[str, Dict[str, pd.DataFrame]],
+                 arms: pd.DataFrame, stat: dict, tau_tbl: pd.DataFrame, ref: dict, regime: dict,
+                 maps: Dict[str, Dict[str, pd.DataFrame]],
                  marginals: Dict[str, pd.DataFrame], gate_tables: Dict[str, pd.DataFrame],
                  gate_attrs: Dict[str, dict], audit: pd.DataFrame, feat: pd.DataFrame) -> str:
-    L: List[str] = ["# Phase 1 report — level-vs-effect dissociation and effect maps\n"]
+    L: List[str] = ["# Phase 1 report — arm decomposition, tau evaluation, effect maps\n"]
 
     L.append("## Setup")
     L.append(f"- dataset: `{cfg_dict['dataset']}`, n = {stats['acc']['n']} (requested {cfg_dict['n_queries']}, seed {cfg_dict['seed']})")
@@ -415,29 +443,39 @@ def write_report(path: str, cfg_dict: dict, versions: dict, data_meta: dict, bin
     L.append(f"- versions: {json.dumps(versions)}")
     L.append(f"- sampling: {json.dumps({k: v for k, v in data_meta.items() if k != 'per_bin_counts'})}\n")
 
-    L.append("## 1. Headline — does each signal predict the level or the effect?\n")
-    n_live = int(diss["n_live"].iloc[0]) if len(diss) and "n_live" in diss.columns else 0
-    L.append("Gates in the literature threshold the **level**. The decision needs the **effect**. "
-             "AUC 0.5 = uninformative; CIs are bootstrap percentiles.\n")
-    L.append(f"`auc_effect_live` is computed on the **decision-live subset** (arms disagree, n = {n_live}): "
-             "`helped` requires arm 0 to be wrong, so any predictor of the level mechanically anti-predicts "
-             "`helped` over all queries. Restricting to queries where retrieval changes the answer removes that "
-             "coupling and asks what a gate actually needs to know. Full-sample `auc_effect` is in "
-             "`dissociation.csv`.\n")
-    show = diss[["feature", "tier", "auc_level", "level_lo", "level_hi",
-                 "auc_effect_live", "live_lo", "live_hi", "gap", "effect_informative"]] if len(diss) else diss
-    L.append(md_table(show, index=False))
-    if head:
-        L.append("\n**Paired contrast** (same resampled rows, best confidence vs best retrieval feature):")
-        for k in ("diff_on_effect", "diff_on_level"):
-            d = head.get(k, {})
-            if d:
-                L.append(f"- {k}: `{d['feature_a']}` − `{d['feature_b']}` on `{d['target']}` = "
-                         f"{d['diff']:+.3f} [{d['lo']:+.3f}, {d['hi']:+.3f}], P(>0) = {d['p_gt_0']:.3f}, n = {d['n']}")
-    L.append("")
+    L.append("## 1. Headline — which arm does each signal know about?\n")
+    L.append("The decision quantity is tau(x) = mu1(x) − mu0(x). Both arms are observed, so each feature "
+             "is scored against each arm separately. `D = AUC(Y1) − AUC(Y0)`: negative means the feature is "
+             "about what the model already knows, positive means it is about what the corpus provides.\n")
+    L.append("_No target here is derived from `helped`. Both the full-sample and the decision-live versions of "
+             "that target are contaminated — with binary outcomes, `helped` on the live subset is identically "
+             "`1 − Y0`, i.e. the level in disguise._\n")
+    L.append(md_table(arms[["feature", "tier", "auc_Y0", "Y0_lo", "Y0_hi", "auc_Y1", "Y1_lo", "Y1_hi",
+                            "D", "D_lo", "D_hi", "separated"]] if len(arms) else arms, index=False))
+    if stat:
+        L.append(f"\n**Dissociation statistic** — `{stat['retr_feature']}` vs `{stat['conf_feature']}`, "
+                 f"paired bootstrap on D(retrieval) − D(confidence):")
+        L.append(f"- confidence: AUC(Y0) = {stat['conf_auc_Y0']:.3f}, AUC(Y1) = {stat['conf_auc_Y1']:.3f}, D = {stat['D_conf']:+.3f}")
+        L.append(f"- retrieval:  AUC(Y0) = {stat['retr_auc_Y0']:.3f}, AUC(Y1) = {stat['retr_auc_Y1']:.3f}, D = {stat['D_retr']:+.3f}")
+        L.append(f"- **difference = {stat['diff']:+.3f} [{stat['lo']:+.3f}, {stat['hi']:+.3f}], "
+                 f"P(>0) = {stat['p_gt_0']:.3f}, n = {stat['n']}**\n")
+
+    L.append("## 1b. Does it matter for the decision? (cross-fitted tau)\n")
+    L.append(f"tau_hat = mu1_hat − mu0_hat, 5-fold cross-fitted per feature set, then used to rank queries for "
+             f"retrieval. `V@r` is the realized value when the top r fraction is retrieved. "
+             f"Reference points: never = {ref['never_retrieve']:.3f}, always = {ref['always_retrieve']:.3f}, "
+             f"oracle = {ref['oracle']:.3f} (headroom over always = {ref['headroom_over_always']:+.3f}).\n")
+    L.append(md_table(tau_tbl, index=False))
+    L.append("\n_CIs resample rows only; they do not propagate estimation uncertainty in tau_hat, so treat "
+             "differences between adjacent feature sets as suggestive at this n._\n")
+    if regime:
+        L.append(f"**Regime:** {regime['regime']} — Y0 = {regime['Y0_mean']:.3f}, Y1 = {regime['Y1_mean']:.3f}. "
+                 f"At a 50% retrieval budget, confidence-only scores {regime['V50_confidence_only']:.3f} and "
+                 f"retrieval-only {regime['V50_retrieval_only']:.3f}: **{regime['winner_at_50pct']} wins here**. "
+                 f"tau = mu1 − mu0, so whichever arm carries more variance dominates the effect.\n")
 
     L.append("## 2. Decision gate")
-    L.append(decision_verdict(stats, diss, head) + "\n")
+    L.append(decision_verdict(stats, arms, stat, tau_tbl, ref, regime) + "\n")
 
     L.append("## 3. Overall effect of retrieval")
     rows = []
@@ -508,10 +546,14 @@ def run_analysis(feat: pd.DataFrame, cfg_dict: dict, versions: dict, data_meta: 
     feat.to_parquet(os.path.join(results_dir, "features_binned.parquet"), index=False)
 
     stats = summary_stats(feat, thresholds)
-    diss = dissociation_table(feat, n_boot=n_boot)
-    head = headline_contrast(feat, n_boot=n_boot)
-    if len(diss):
-        diss.to_csv(os.path.join(results_dir, "dissociation.csv"), index=False)
+    arms = arm_decomposition(feat, n_boot=n_boot)
+    stat = dissociation_statistic(feat, n_boot=n_boot)
+    tau_tbl, ref = tau_evaluation(feat, n_boot=min(n_boot, 400))
+    regime = regime_diagnostic(feat, arms, tau_tbl)
+    if len(arms):
+        arms.to_csv(os.path.join(results_dir, "arm_decomposition.csv"), index=False)
+    if len(tau_tbl):
+        tau_tbl.to_csv(os.path.join(results_dir, "tau_evaluation.csv"), index=False)
 
     maps = {
         "retrieval score × ambiguity (the informative axes)": cell_tables(feat, "ambig_bin", "retr_bin"),
@@ -539,7 +581,8 @@ def run_analysis(feat: pd.DataFrame, cfg_dict: dict, versions: dict, data_meta: 
             gate_attrs[name] = dict(c.attrs)
             c.to_csv(os.path.join(results_dir, f"gate_curve_{len(curves)}.csv"), index=False)
 
-    plot_dissociation(diss, os.path.join(figures_dir, "dissociation.png"))
+    plot_arm_plane(arms, os.path.join(figures_dir, "arm_plane.png"))
+    plot_tau_eval(tau_tbl, ref, os.path.join(figures_dir, "tau_evaluation.png"))
     plot_effect_map(maps["retrieval score × ambiguity (the informative axes)"],
                     "retrieval-score bin (0 = lowest)", "subject-length bin (0 = shortest/most ambiguous)",
                     "Effect map — informative axes", os.path.join(figures_dir, "effect_map_informative.png"))
@@ -550,8 +593,9 @@ def run_analysis(feat: pd.DataFrame, cfg_dict: dict, versions: dict, data_meta: 
     plot_gates(curves, os.path.join(figures_dir, "gate_regret.png"))
     plot_delta_hist(feat, os.path.join(figures_dir, "delta_hist.png"))
 
-    summary = {"stats": stats, "headline": head,
-               "dissociation": diss.to_dict("records") if len(diss) else [],
+    summary = {"stats": stats, "dissociation_statistic": stat, "regime": regime, "reference": ref,
+               "arm_decomposition": arms.to_dict("records") if len(arms) else [],
+               "tau_evaluation": tau_tbl.to_dict("records") if len(tau_tbl) else [],
                "bins": bin_meta, "data_meta": data_meta, "versions": versions, "config": cfg_dict,
                "maps": {k: {kk: vv.to_dict() for kk, vv in t.items() if len(vv)} for k, t in maps.items()},
                "gate_attrs": gate_attrs,
@@ -560,8 +604,9 @@ def run_analysis(feat: pd.DataFrame, cfg_dict: dict, versions: dict, data_meta: 
         json.dump(summary, f, indent=2, default=_json_default)
 
     report = write_report(os.path.join(results_dir, "report.md"), cfg_dict, versions, data_meta, bin_meta, stats,
-                          diss, head, maps, marginals, gate_tables, gate_attrs, audit, feat)
-    return {"summary": summary, "report": report, "feat": feat, "dissociation": diss}
+                          arms, stat, tau_tbl, ref, regime, maps, marginals, gate_tables, gate_attrs, audit, feat)
+    return {"summary": summary, "report": report, "feat": feat,
+            "arms": arms, "tau": tau_tbl, "statistic": stat, "regime": regime, "reference": ref}
 
 
 def _json_default(o):

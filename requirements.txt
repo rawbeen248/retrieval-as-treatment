@@ -1,8 +1,9 @@
 # Installed on Colab with: pip install -r requirements.txt
 # torch is provided by the Colab runtime; faiss-cpu comes in via pyserini.
 transformers>=4.46
+pillow>=11.3,<12
 accelerate>=1.0
-bitsandbytes>=0.44
+bitsandbytes>=0.46.1
 datasets>=3.0
 pyserini>=0.44
 pandas>=2.0

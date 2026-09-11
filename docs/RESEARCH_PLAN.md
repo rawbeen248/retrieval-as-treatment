@@ -6,13 +6,49 @@
 
 **Target venues.** ARR December 2026 cycle → ACL 2027 (main or Findings); fallbacks: UncertaiNLP 2027, TrustNLP, or an IR venue (SIGIR / CIKM short). The paper is a *method + tool* paper with a small theory section, which fits ACL/EMNLP "efficient methods" and "evaluation" tracks.
 
-**Status.** Revised after the Phase-1 pilot (n=100, PopQA, Qwen2.5-7B-Instruct, BM25 top-5). Every number that appears in the eventual paper must be regenerable from the released code (this rule carried over from the previous project and stays).
+**Status.** Revised after the Phase-1 runs: an n=100 PopQA pilot, then n=300 on PopQA **and** TriviaQA. Every number that appears in the eventual paper must be regenerable from the released code (this rule carried over from the previous project and stays).
 
 ---
 
-## 0. Pilot results and what they changed
+## 0. Phase-1 results and what they changed
+
+### 0.1 The n=300 × 2 run — the regime finding
+
+| | PopQA | TriviaQA |
+|---|---|---|
+| Y⁰ / Y¹ containment accuracy | 0.170 / 0.297 | 0.563 / 0.713 |
+| helped / harmed / both wrong | 50 / 12 / 199 | 74 / 29 / 57 |
+| decision-live fraction | 21% | 34% |
+| oracle / headroom over always-retrieve | 0.337 / +0.040 | 0.810 / +0.097 |
+| best confidence feature → AUC(Y⁰), AUC(Y¹) | 0.900, 0.702 | 0.817, 0.586 |
+| best retrieval feature → AUC(Y⁰), AUC(Y¹) | 0.719, 0.881 | 0.490, 0.662 |
+| dissociation statistic D(retr) − D(conf) | **+0.370** [0.279, 0.473] | **+0.380** [0.269, 0.481] |
+| V@50% confidence-only / retrieval-only | 0.253 / 0.293 | 0.710 / 0.670 |
+| **which family wins the decision** | **retrieval** | **confidence** |
+
+**Two results.**
+
+1. **Structural (holds in both datasets).** Confidence features attach to the parametric arm, retrieval features to the retrieval arm; the paired dissociation statistic is ≈ +0.37 with CIs excluding zero in both. Since τ = μ₁ − μ₀, neither family alone determines the decision quantity.
+2. **Regime dependence (the interesting result).** Which family actually drives a better decision *flips by dataset*. On PopQA the model is at a floor, so μ₀ barely varies, τ ≈ μ₁, and retrieval signals win. On TriviaQA the model is competent, μ₀ carries the variance, and confidence wins. **Consequence:** the paper's claim is not "confidence is the wrong proxy" — a single-dataset artifact — but *no fixed proxy is correct across regimes, and which one is correct depends on where the outcome variance sits*. Every published gate hard-codes one proxy; estimating τ adapts automatically. This is a stronger and more defensible thesis, and it requires reporting both a model-limited and a corpus-limited dataset, so both stay.
+
+**The dataset diagnosis was right.** TriviaQA yields 2.4× the harm cases, a 34% decision-live fraction against 21%, both-arms-wrong collapsing from 199 to 57, and more than double the oracle headroom. TriviaQA becomes primary; PopQA is retained as the contrasting regime.
+
+### 0.2 Two circular targets that had to be discarded
+
+Both were implemented and both produced results that looked like findings:
+
+- `AUC(feature → helped)` over all queries. `helped` requires Y⁰ = 0, so any predictor of the level anti-predicts it mechanically.
+- `AUC(feature → helped)` on the decision-live subset. Worse: with binary outcomes, "the arms disagree" means exactly one is right, so on that subset `helped ≡ 1 − Y⁰` **identically** (verified in both datasets). It is the level in disguise, and it produced a spurious 0.843 "effect AUC" for confidence on PopQA.
+
+Everything now reports against Y⁰, Y¹, or Δ. A regression test fails if `helped` reappears as a prediction target. Separation uses |AUC − 0.5| rather than raw AUC, because features like entropy point downward by construction and a raw difference misreads them.
+
+The general lesson, which belongs in the paper's methodology section: when both potential outcomes are observed, derived binary labels like "helped" are algebraic functions of the arms, and conditioning on the arms disagreeing collapses them onto a single arm. Effect analyses must target the arms or the difference, not a derived label.
+
+### 0.3 Pilot results (n=100, PopQA) and what they changed
 
 The pilot was run to check whether retrieval harm is common enough to motivate the paper. It is not — and the run produced a stronger result instead.
+
+Superseded in part by §0.1, retained because the feature-engineering consequences still stand.
 
 **Measured (n=100, PopQA, Qwen2.5-7B-Instruct, BM25 top-5, greedy):**
 
@@ -30,13 +66,13 @@ The pilot was run to check whether retrieval harm is common enough to motivate t
 
 **Five findings and their consequences.**
 
-1. **The dissociation is real and is the paper's thesis.** Confidence predicts the level well and the effect at chance; retrieval-side and ambiguity signals invert this. Paired bootstrap on the decision-live subset: retrieval − confidence on the effect = +0.588 [+0.333, +0.819], P(>0)=1.000. **Consequence:** the dissociation becomes the paper's opening claim and Figure 1 (§3, §4.5a). It does not depend on harm being common, which makes the paper robust to the harm rate at scale.
+1. **A confidence/retrieval split exists.** *(Superseded: the numbers quoted here used the contaminated target described in §0.2. The structural claim survives in corrected form — see §0.1 — but the "+0.588" figure does not.)* **Consequence:** the arm decomposition and τ evaluation became the paper's opening analyses (§3, §4.5a).
 2. **The harm map, as designed, does not reproduce.** Mean Δ across popularity bins: 0.133, 0.053, 0.163, 0.092, 0.179 — no trend; confidence bins likewise flat. Two causes: the sample never reached the popular tail (max log_pop 5.25 vs 7.18 available), and a 7B model on PopQA's long tail is wrong in both arms 63% of the time. **Consequence:** the harm map is demoted from lede to support; its axes become retrieval score × ambiguity, with confidence × popularity kept as a deliberate contrast figure showing the axes gates use are flat.
 3. **Harm has a specific mechanism: entity ambiguity, not popularity.** All three genuine flips were short polysemous subjects (`Idaho` → "Idaho potato", `Summit` → Panama, `X` → "The X Factor SA"). Mean Δ by subject-name length: −0.047 (short) → +0.125 (mid) → +0.394 (long). **Consequence:** ambiguity features added to tier F0 (§4.3); the mechanism is a named finding in the paper rather than an unexplained quadrant.
 4. **Token-F1 over-counts harm roughly 2×.** Of seven negative-ΔF1 cases, three were genuine right→wrong flips; two had arm 1 still containing the gold answer but penalised for extra tokens ("fantasy MMORPG" vs gold "fantasy"; "Metropolitan City of Turin" vs "Province of Turin"), and two were both-arms-wrong partial credit. **Consequence:** containment accuracy becomes the primary effect definition; F1 remains the continuous outcome; every negative case is classified in a harm-audit table (§4.4).
 5. **Raw BM25 scores are not comparable across queries.** `retr_top1` correlates r=0.70 with subject-name length (longer names ⇒ more IDF mass); residualising on name and question length drops the effect AUC from 0.906 to 0.663. **Consequence:** normalized retrieval features added to tier F1 and used for all headline claims; raw score reported only for reference (§4.3).
 
-**A sixth point, methodological, found while implementing the analysis.** `helped` requires arm 0 to be wrong, so *any* predictor of the level mechanically anti-predicts `helped` over the full sample, whether or not it knows anything about retrieval. All headline effect AUCs are therefore computed on the **decision-live subset** (arms disagree, so exactly one of helped/harmed holds). Full-sample AUCs are still reported in the appendix. A reviewer would otherwise catch this, and it would invalidate the central table.
+**A sixth point, methodological.** See §0.2 — the first attempt to correct for this confound introduced a worse one, and both are now documented as a cautionary result in their own right.
 
 ---
 
@@ -111,7 +147,7 @@ Potential outcomes (Rubin 1974); AIPW / doubly-robust estimation (Robins, Rotnit
 
 ## 3. Contributions (what the paper claims)
 
-1. **The level-vs-effect dissociation.** The paper's central empirical claim, and Figure 1: signals the literature gates on predict whether the model is wrong (AUC ≈ 0.84 in the pilot) but not whether retrieval will help (≈ 0.44, CI straddling chance), while cheap retrieval-side and entity-ambiguity signals invert this. Measured across datasets, retriever tiers, and models, with bootstrap CIs and paired contrasts on the decision-live subset.
+1. **The arm decomposition and the regime result.** Figure 1: each pre-decision signal placed by what it knows about the parametric arm versus the retrieval arm, with bootstrap CIs and a paired dissociation statistic (≈ +0.37, CI excluding zero, in both datasets). Figure 2: which family actually drives a better decision flips between a model-limited dataset (PopQA, retrieval signals win) and a corpus-limited one (TriviaQA, confidence wins). No fixed proxy is correct across regimes — the argument for estimating τ. Measured across datasets, retriever tiers, and models.
 2. **Formulation.** Adaptive retrieval as treatment-effect estimation and policy learning; a proposition characterizing exactly when proxy gates are optimal, and a regret decomposition (harm vs forgone benefit) that is directly measurable in our setup. The dissociation is the empirical counterpart of the proposition.
 3. **Effect maps and the ambiguity mechanism.** Where retrieval lowers answer quality, mapped on axes that carry signal (retrieval score × entity ambiguity) with the literature's axes (confidence × popularity) as an explicit contrast, plus an audit separating genuine flips from scoring artifacts.
 4. **Effect-based gating.** DR-learner CATE estimation from pre-decision features; policies that dominate uncertainty, complexity, and popularity gates on the accuracy-vs-cost frontier at matched retrieval rate; regret bound stated and empirically checked against the observed oracle.
@@ -172,14 +208,15 @@ Sizes (initial): 3,000 queries per dataset for the full-factorial calibration se
 
 Decoding: greedy for the main results; a temperature-0.7, 3-sample variant on a subset to demonstrate the estimators under genuinely stochastic outcomes.
 
-### 4.5a The dissociation analysis (Figure 1)
+### 4.5a Arm decomposition and τ evaluation (Figures 1–2)
 
-For every pre-decision feature $x_j$, report with bootstrap CIs:
+**Arm decomposition.** For every pre-decision feature $x_j$, report with bootstrap CIs $\mathrm{AUC}(x_j \to Y^{(0)})$ and $\mathrm{AUC}(x_j \to Y^{(1)})$, plus the orientation-invariant separation
+$$D(x_j) = |\mathrm{AUC}(x_j \to Y^{(1)}) - 0.5| - |\mathrm{AUC}(x_j \to Y^{(0)}) - 0.5|.$$
+Plot features in the $(\mathrm{AUC}_0, \mathrm{AUC}_1)$ plane, coloured by tier. The dissociation statistic is $D(\text{best retrieval feature}) - D(\text{best confidence feature})$ by paired bootstrap. Absolute deviations are required: entropy-type features point downward by construction, and a raw AUC difference misreads them as knowing the retrieval arm.
 
-- $\mathrm{AUC}_{\text{level}}(x_j) = \mathrm{AUC}(x_j \to Y^{(0)}\text{ correct})$ — what proxy gates implicitly target.
-- $\mathrm{AUC}_{\text{effect}}(x_j) = \mathrm{AUC}(x_j \to \text{helped})$ on the decision-live subset — what the decision requires.
+**τ evaluation.** Cross-fit $\hat\tau = \hat\mu_1 - \hat\mu_0$ (5-fold) from each feature set, then score it the way a gate is scored: correlation with the observed $\Delta$, and realized policy value at matched retrieval rates against never/always/oracle. Report which family wins per dataset; the flip between regimes is Figure 2 and the paper's central argument. The nuisance models here are the same objects the DR-learner uses in Phase 3, so this is Phase 3 machinery validated early.
 
-Plot features in this plane, coloured by tier (confidence / popularity / ambiguity / retrieval). The claim is a visible separation: confidence features sit bottom-right (informative about the level, uninformative about the effect), retrieval and ambiguity features top-left. Paired bootstrap on the AUC difference between the best confidence feature and the best retrieval feature gives the headline number. Report the same plane per dataset, per retriever tier, and per model, since the claim's generality is what makes it a contribution rather than an artifact of one setup.
+**What must not be used.** Any target derived from `helped` (see §0.2). Targets are $Y^{(0)}$, $Y^{(1)}$, or $\Delta$.
 
 This is the empirical counterpart of Prop. 2 (§4.9): a gate thresholding $g(\mu_0)$ is optimal only if $\tau$ is monotone in $\mu_0$, and the dissociation is what that failure looks like in data.
 
@@ -382,7 +419,8 @@ Estimates assume Qwen2.5-7B-Instruct in 4-bit, batched generation, prompts of ~6
 | Risk | Mitigation |
 |---|---|
 | Harm rate turns out negligible | **Observed in the pilot (3/100).** The paper's claim is the dissociation, which does not require common harm. To raise the harm rate, change the *dataset* (TriviaQA, where arm 0 is often right), not the model — harm requires arm 0 to be correct first, so a smaller LLM reduces harm opportunities even though it is more distractible |
-| Reviewer: "the effect AUC is mechanically coupled to the level AUC" | Headline effect AUCs are computed on the decision-live subset, where `helped` and `harmed` partition the sample; full-sample AUCs in the appendix |
+| Reviewer: "the effect AUC is mechanically coupled to the level AUC" | **Correct, twice over** (§0.2). No target derived from `helped` is used anywhere; analyses target $Y^{(0)}$, $Y^{(1)}$, or $\Delta$, with a regression test enforcing it. The episode itself goes in the methodology section as a caution |
+| Reviewer: "your headline flips between datasets, so which is it?" | That flip *is* the result (§0.1): which proxy is informative depends on which arm carries the variance. Reported with the regime diagnostic (Y⁰ level) that predicts the direction |
 | Reviewer: "BM25 score is not comparable across queries" | **True, and measured** (r=0.70 with subject length). Normalized features carry all headline claims; dense tier added; raw score reported for reference only |
 | Small decision-live subset makes CIs wide | Live fraction was 20% at pilot scale; scale-up targets ≥600 live queries per dataset. Report the live count next to every effect AUC |
 | Reviewer: "you can just run both arms" | §4.1 argument; multi-arm extension; single-arm deployment framing; stochastic-outcome subset; and the both-arms set is what *validates* the estimators |
@@ -398,7 +436,7 @@ Estimates assume Qwen2.5-7B-Instruct in 4-bit, batched generation, prompts of ~6
 
 ## 9. Limitations to state in the paper
 
-The dissociation is measured, not proven, and is a property of the setups tested; we report it per dataset, retriever tier, and model rather than claiming universality. Ambiguity features use PopQA's gold subject string where available and a capitalized-span heuristic elsewhere — a proxy, flagged as such. $\tau$ is a property of a (model, retriever, corpus, prompt) tuple, not of queries in the abstract; harm maps do not transfer across models without re-logging. OPE is valid for the logged action set and logged feature superset only, and for target queries from the logging distribution. Greedy decoding makes outcomes deterministic on benchmarks; the stochastic subset partially addresses this. English-only; short-answer QA; 7–8B open models. No claims about generation quality relative to larger LLMs.
+The arm decomposition and the regime flip are measured, not proven, and are properties of the setups tested; we report them per dataset, retriever tier, and model rather than claiming universality. The regime diagnostic (base-model accuracy) is a hypothesis about *why* the flip happens, supported by two datasets — Phase 2's four datasets and second model are what would make it a claim. Ambiguity features use PopQA's gold subject string where available and a capitalized-span heuristic elsewhere — a proxy, flagged as such. $\tau$ is a property of a (model, retriever, corpus, prompt) tuple, not of queries in the abstract; harm maps do not transfer across models without re-logging. OPE is valid for the logged action set and logged feature superset only, and for target queries from the logging distribution. Greedy decoding makes outcomes deterministic on benchmarks; the stochastic subset partially addresses this. English-only; short-answer QA; 7–8B open models. No claims about generation quality relative to larger LLMs.
 
 ---
 
